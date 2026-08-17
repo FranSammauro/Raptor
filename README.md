@@ -5,7 +5,21 @@ Reverse Proxy / API Gateway de alto rendimiento, escrito en Rust.
 Ver [informe técnico completo](docs/architecture.md) para el diseño conceptual
 y el roadmap de fases.
 
-## Estado actual: Fase 1 — Core ✅
+## Estado actual: Fase 2 — Upstreams ✅
+
+- [x] Múltiples backends por upstream (`upstreams.<nombre>.servers`)
+- [x] Round Robin lock-free (atomics, sin locks en el hot path)
+- [x] Health checks periódicos configurables por upstream (`GET /health`)
+- [x] Failure/success threshold para evitar flapping (HEALTHY ↔ UNHEALTHY)
+- [x] Exclusión automática de backends UNHEALTHY de la rotación
+- [x] Fail-closed: `503 Service Unavailable` si un upstream no tiene
+      ningún backend sano (en vez de enviar tráfico a un backend caído)
+- [x] Unit tests del balancer (7 tests) + integration tests multi-backend
+      (8 tests)
+
+Ver sección "Fase 1 — Core ✅" más abajo para el detalle de esa fase.
+
+### Fase 1 — Core ✅
 
 - [x] HTTP server (Axum sobre Tokio)
 - [x] Request forwarding hacia un upstream
@@ -57,15 +71,35 @@ logging:
 
 routes:
   - path: /api/users
-    upstream: http://localhost:3001
+    upstream: users   # referencia al nombre del upstream, no una URL
 
-  - path: /api/auth
-    upstream: http://localhost:3002
+upstreams:
+  users:
+    load_balancer: round_robin
+    health_check:
+      path: /health
+      interval_secs: 10
+      timeout_secs: 2
+      healthy_threshold: 2   # checks OK consecutivos para volver a HEALTHY
+      unhealthy_threshold: 3 # checks fallidos consecutivos para UNHEALTHY
+    servers:
+      - http://localhost:3001
+      - http://localhost:3011
+      - http://localhost:3021
 ```
 
-Cada ruta matchea por prefijo de path (longest-prefix-match: rutas más
-específicas ganan sobre rutas más genéricas) y reenvía al `upstream`
-indicado, preservando path, query string, método, headers y body.
+Cada ruta matchea por prefijo de path (longest-prefix-match) y resuelve a
+un **upstream** por nombre. Cada upstream mantiene su propio pool de
+backends: Raptor selecciona uno vía Round Robin, excluyendo los que el
+health checker haya marcado `UNHEALTHY`. Si ningún backend del upstream
+está sano, la request recibe `503 Service Unavailable` (fail-closed) en
+vez de reenviarse a un backend caído.
+
+Un backend arranca optimísticamente como `HEALTHY` (para no rechazar
+tráfico antes del primer check) y cambia de estado sólo después de
+`healthy_threshold`/`unhealthy_threshold` checks consecutivos — esto evita
+que un único fallo transitorio lo saque y meta del pool constantemente
+(flapping).
 
 ## Testing
 
@@ -84,7 +118,7 @@ Ver [docs/architecture.md](docs/architecture.md), sección 25, para el
 detalle completo de las 7 fases planeadas. Resumen:
 
 - [x] **Fase 1 — Core**
-- [ ] **Fase 2 — Upstreams**: múltiples backends por servicio, Round Robin,
+- [x] **Fase 2 — Upstreams**: múltiples backends por servicio, Round Robin,
       health checks, connection pooling
 - [ ] **Fase 3 — Reliability**: timeouts, retries, circuit breaker,
       graceful shutdown

@@ -6,10 +6,34 @@ logging:
 
 routes:
   - path: /api/users
-    upstream: http://localhost:3001
+    upstream: users
 
   - path: /api/auth
-    upstream: http://localhost:3002
+    upstream: auth
 
   - path: /api/files
-    upstream: http://localhost:3003
+    upstream: files
+
+upstreams:
+  users:
+    load_balancer: round_robin
+    health_check:
+      path: /health
+      interval_secs: 10
+      timeout_secs: 2
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+    servers:
+      - http://localhost:3001
+      - http://localhost:3011
+      - http://localhost:3021
+
+  auth:
+    load_balancer: round_robin
+    servers:
+      - http://localhost:3002
+
+  files:
+    load_balancer: round_robin
+    servers:
+      - http://localhost:3003

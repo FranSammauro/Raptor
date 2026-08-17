@@ -1,8 +1,11 @@
-//! Núcleo del reverse proxy: recibe un request entrante, lo reenvía al
-//! upstream que le indique el Router, y devuelve la respuesta al cliente.
+//! Núcleo del reverse proxy: recibe un request entrante, lo matchea contra
+//! el router (path -> nombre de upstream), selecciona un backend sano vía
+//! el load balancer del upstream, reenvía el request y devuelve la
+//! respuesta al cliente.
 //!
-//! Fase 1 (Core): forwarding simple 1:1 sin retries, sin circuit breaker,
-//! sin balanceo entre múltiples servidores por upstream (eso es Fase 2/3).
+//! Fase 2: forwarding hacia múltiples backends por upstream, con Round
+//! Robin y exclusión de backends UNHEALTHY. Todavía sin retries ni
+//! circuit breaker (eso es Fase 3).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +20,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use uuid::Uuid;
 
+use crate::balancer::UpstreamManager;
 use crate::router::Router;
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -25,22 +29,24 @@ pub type HttpClient = Client<HttpConnector, Body>;
 #[derive(Clone)]
 pub struct AppState {
     pub router: Arc<Router>,
+    pub upstreams: Arc<UpstreamManager>,
     pub client: HttpClient,
 }
 
 impl AppState {
-    pub fn new(router: Router) -> Self {
-        let client: HttpClient =
-            Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    pub fn new(router: Router, upstreams: UpstreamManager) -> Self {
+        let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         Self {
             router: Arc::new(router),
+            upstreams: Arc::new(upstreams),
             client,
         }
     }
 }
 
 /// Handler catch-all: recibe cualquier request entrante, lo matchea
-/// contra el router y lo reenvía al upstream correspondiente.
+/// contra el router, selecciona un backend del upstream correspondiente
+/// y lo reenvía.
 pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
@@ -50,24 +56,48 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
     let route = match state.router.match_route(&path) {
         Some(route) => route.clone(),
         None => {
-            tracing::warn!(
-                request_id = %request_id,
-                %method,
-                %path,
-                "no matching route"
-            );
+            tracing::warn!(request_id = %request_id, %method, %path, "no matching route");
             return (StatusCode::NOT_FOUND, "no matching route").into_response();
         }
     };
 
-    let response = match forward(&state.client, &route.upstream, req, request_id).await {
+    let pool = match state.upstreams.get(&route.upstream) {
+        Some(pool) => pool,
+        None => {
+            // No debería pasar: Config::validate() ya garantiza que toda
+            // ruta referencia un upstream existente. Nos cubrimos igual.
+            tracing::error!(
+                request_id = %request_id, %method, %path,
+                upstream = %route.upstream,
+                "route references an unknown upstream"
+            );
+            return (StatusCode::BAD_GATEWAY, "unknown upstream").into_response();
+        }
+    };
+
+    let backend = match pool.select() {
+        Some(backend) => backend,
+        None => {
+            tracing::error!(
+                request_id = %request_id, %method, %path,
+                upstream = %route.upstream,
+                "no healthy backend available"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no healthy backend available",
+            )
+                .into_response();
+        }
+    };
+
+    let response = match forward(&state.client, &backend.url, req, request_id).await {
         Ok(resp) => resp,
         Err(err) => {
             tracing::error!(
-                request_id = %request_id,
-                %method,
-                %path,
+                request_id = %request_id, %method, %path,
                 upstream = %route.upstream,
+                backend = %backend.url,
                 error = %err,
                 "upstream unreachable"
             );
@@ -83,6 +113,7 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
         %method,
         %path,
         upstream = %route.upstream,
+        backend = %backend.url,
         status = %status.as_u16(),
         latency_ms = %elapsed.as_millis(),
         "request handled"
@@ -91,11 +122,12 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
     response
 }
 
-/// Reescribe el URI del request entrante para que apunte al upstream,
-/// preservando path y query string, y lo envía usando el cliente Hyper.
+/// Reescribe el URI del request entrante para que apunte al backend
+/// seleccionado, preservando path y query string, y lo envía usando el
+/// cliente Hyper.
 async fn forward(
     client: &HttpClient,
-    upstream_base: &str,
+    backend_url: &str,
     mut req: axum::extract::Request,
     request_id: Uuid,
 ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
@@ -105,8 +137,8 @@ async fn forward(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let new_uri: Uri = format!("{}{}", upstream_base.trim_end_matches('/'), path_and_query)
-        .parse()?;
+    let new_uri: Uri =
+        format!("{}{}", backend_url.trim_end_matches('/'), path_and_query).parse()?;
 
     *req.uri_mut() = new_uri;
 

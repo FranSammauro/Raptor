@@ -21,7 +21,7 @@ impl Router {
         // Longest-prefix-match: ordenamos por longitud de path descendente
         // para que rutas más específicas (ej: /api/users/admin) tengan
         // prioridad sobre rutas más genéricas (ej: /api/users).
-        routes.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        routes.sort_by_key(|route| std::cmp::Reverse(route.path.len()));
         Self { routes }
     }
 

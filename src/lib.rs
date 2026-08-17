@@ -4,7 +4,9 @@
 //! testear la aplicación completa en memoria con `tower::ServiceExt::oneshot`,
 //! sin depender de binding real de sockets ni de procesos externos.
 
+pub mod balancer;
 pub mod config;
+pub mod health;
 pub mod proxy;
 pub mod router;
 
