@@ -5,7 +5,26 @@ Reverse Proxy / API Gateway de alto rendimiento, escrito en Rust.
 Ver [informe técnico completo](docs/architecture.md) para el diseño conceptual
 y el roadmap de fases.
 
-## Estado actual: Fase 2 — Upstreams ✅
+## Estado actual: Fase 3 — Reliability
+
+- [x] Timeout configurable por upstream (`timeout_ms`), aplicado a cada
+      intento individual contra un backend
+- [x] Retries con backoff fijo, sólo para métodos idempotentes
+      (GET, HEAD, OPTIONS, PUT, DELETE); POST/PATCH nunca se reintentan
+      aunque el upstream tenga `retry.max_attempts` > 1
+- [x] Cada reintento va a un backend distinto del mismo upstream (gracias
+      al cursor de Round Robin, que avanza en cada `select()`)
+- [x] Circuit breaker por backend: CLOSED / OPEN / HALF-OPEN, con
+      failure threshold y cooldown configurables
+- [x] Distinción de errores al agotar los intentos: `502` (falla de
+      conexión), `504` (timeout) o `503` (sin backends disponibles)
+- [x] Graceful shutdown: `SIGINT`/`SIGTERM` dejan de aceptar conexiones
+      nuevas y esperan a que terminen las que ya estaban en curso
+- [x] Unit tests del circuit breaker (6) + integración con el balancer
+      (1) + integration tests end-to-end (retry, timeout, circuit
+      breaker abriéndose con tráfico real)
+
+### Fase 2 — Upstreams ✅
 
 - [x] Múltiples backends por upstream (`upstreams.<nombre>.servers`)
 - [x] Round Robin lock-free (atomics, sin locks en el hot path)
@@ -60,6 +79,10 @@ cargo build --release
 ./target/release/raptor
 ```
 
+Para bajarlo de forma prolija: `Ctrl+C` (SIGINT) o `kill -TERM <pid>`.
+Raptor deja de aceptar conexiones nuevas y espera a que las que ya están
+en curso terminen antes de salir.
+
 ### Configuración (`raptor.yaml`)
 
 ```yaml
@@ -76,6 +99,13 @@ routes:
 upstreams:
   users:
     load_balancer: round_robin
+    timeout_ms: 5000       # timeout por intento contra un backend
+    retry:
+      max_attempts: 2      # 1 = sin retry. Sólo aplica a métodos idempotentes
+      backoff_ms: 100
+    circuit_breaker:
+      failure_threshold: 5     # fallos reales seguidos para abrir el circuito
+      open_duration_secs: 30   # cuánto espera antes de probar de nuevo (HALF-OPEN)
     health_check:
       path: /health
       interval_secs: 10
@@ -91,15 +121,33 @@ upstreams:
 Cada ruta matchea por prefijo de path (longest-prefix-match) y resuelve a
 un **upstream** por nombre. Cada upstream mantiene su propio pool de
 backends: Raptor selecciona uno vía Round Robin, excluyendo los que el
-health checker haya marcado `UNHEALTHY`. Si ningún backend del upstream
-está sano, la request recibe `503 Service Unavailable` (fail-closed) en
-vez de reenviarse a un backend caído.
+health checker haya marcado `UNHEALTHY` o cuyo circuit breaker esté
+`OPEN`. Si ningún backend del upstream está disponible, la request recibe
+`503 Service Unavailable` (fail-closed) en vez de reenviarse a un backend
+caído.
 
 Un backend arranca optimísticamente como `HEALTHY` (para no rechazar
 tráfico antes del primer check) y cambia de estado sólo después de
 `healthy_threshold`/`unhealthy_threshold` checks consecutivos — esto evita
 que un único fallo transitorio lo saque y meta del pool constantemente
 (flapping).
+
+**Health check vs. circuit breaker:** son dos mecanismos distintos que se
+complementan. El health check es proactivo — le pega a `/health`
+periódicamente, haya tráfico real o no. El circuit breaker es reactivo —
+mide fallos en requests reales de usuarios y, si un backend viene
+fallando seguido, deja de mandarle tráfico por un rato (`open_duration_secs`)
+antes de probarlo de nuevo con un único request de prueba (`HALF-OPEN`).
+Un backend puede pasar el health check y romperse igual bajo carga real;
+por eso conviene tener las dos capas.
+
+**Retries:** sólo se reintentan métodos idempotentes (`GET`, `HEAD`,
+`OPTIONS`, `PUT`, `DELETE`). Un `POST` o `PATCH` nunca se reintenta,
+aunque `retry.max_attempts` sea mayor a 1 — repetir una escritura no
+idempotente puede duplicar un efecto de lado (una alta, un cobro, etc.).
+Cada intento adicional selecciona un backend distinto del mismo upstream
+(vía el cursor de Round Robin), así que un reintento típico termina
+yendo a otro servidor, no al mismo que ya falló.
 
 ## Testing
 
@@ -120,7 +168,7 @@ detalle completo de las 7 fases planeadas. Resumen:
 - [x] **Fase 1 — Core**
 - [x] **Fase 2 — Upstreams**: múltiples backends por servicio, Round Robin,
       health checks, connection pooling
-- [ ] **Fase 3 — Reliability**: timeouts, retries, circuit breaker,
+- [x] **Fase 3 — Reliability**: timeouts, retries, circuit breaker,
       graceful shutdown
 - [ ] **Fase 4 — Security**: rate limiting, API keys, JWT, TLS, SSRF
 - [ ] **Fase 5 — Observability**: métricas Prometheus, admin API

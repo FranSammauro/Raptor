@@ -27,6 +27,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::circuit::CircuitBreaker;
 use crate::config::UpstreamConfig;
 
 /// Un servidor individual dentro de un upstream.
@@ -36,10 +37,11 @@ pub struct Backend {
     healthy: AtomicBool,
     consecutive_successes: AtomicU32,
     consecutive_failures: AtomicU32,
+    pub circuit: CircuitBreaker,
 }
 
 impl Backend {
-    fn new(url: String) -> Self {
+    fn new(url: String, circuit_breaker_config: &crate::config::CircuitBreakerConfig) -> Self {
         // Optimistic default: un backend recién arrancado se asume HEALTHY
         // hasta que el health checker demuestre lo contrario. Esto evita
         // que Raptor rechace tráfico al arrancar, antes de que corra el
@@ -49,6 +51,7 @@ impl Backend {
             healthy: AtomicBool::new(true),
             consecutive_successes: AtomicU32::new(0),
             consecutive_failures: AtomicU32::new(0),
+            circuit: CircuitBreaker::new(circuit_breaker_config),
         }
     }
 
@@ -101,6 +104,8 @@ pub struct UpstreamPool {
     backends: Vec<Arc<Backend>>,
     cursor: AtomicUsize,
     pub health_check: crate::config::HealthCheckConfig,
+    pub timeout_ms: u64,
+    pub retry: crate::config::RetryConfig,
 }
 
 impl UpstreamPool {
@@ -108,7 +113,7 @@ impl UpstreamPool {
         let backends = config
             .servers
             .iter()
-            .map(|url| Arc::new(Backend::new(url.clone())))
+            .map(|url| Arc::new(Backend::new(url.clone(), &config.circuit_breaker)))
             .collect();
 
         Self {
@@ -116,6 +121,8 @@ impl UpstreamPool {
             backends,
             cursor: AtomicUsize::new(0),
             health_check: config.health_check.clone(),
+            timeout_ms: config.timeout_ms,
+            retry: config.retry.clone(),
         }
     }
 
@@ -123,11 +130,14 @@ impl UpstreamPool {
         &self.backends
     }
 
-    /// Selecciona el próximo backend sano vía Round Robin.
+    /// Selecciona el próximo backend disponible vía Round Robin.
     ///
-    /// Devuelve `None` si el pool está vacío o si *todos* los backends
-    /// están UNHEALTHY (fail-closed: preferimos devolver 503 antes que
-    /// mandar tráfico a un backend que sabemos que está caído).
+    /// "Disponible" acá quiere decir dos cosas a la vez: que el health
+    /// checker no lo haya marcado UNHEALTHY, Y que su circuit breaker no
+    /// esté OPEN. Devuelve `None` si el pool está vacío o si no queda
+    /// ningún backend que cumpla ambas condiciones (fail-closed: mejor
+    /// un 503 prolijo que mandar tráfico a algo que sabemos que está
+    /// roto).
     pub fn select(&self) -> Option<Arc<Backend>> {
         let len = self.backends.len();
         if len == 0 {
@@ -138,7 +148,7 @@ impl UpstreamPool {
 
         (0..len)
             .map(|offset| &self.backends[(start + offset) % len])
-            .find(|backend| backend.is_healthy())
+            .find(|backend| backend.is_healthy() && backend.circuit.is_available())
             .cloned()
     }
 }
@@ -171,13 +181,18 @@ impl UpstreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HealthCheckConfig, LoadBalancerStrategy};
+    use crate::config::{
+        CircuitBreakerConfig, HealthCheckConfig, LoadBalancerStrategy, RetryConfig,
+    };
 
     fn upstream_config(servers: &[&str]) -> UpstreamConfig {
         UpstreamConfig {
             load_balancer: LoadBalancerStrategy::RoundRobin,
             servers: servers.iter().map(|s| s.to_string()).collect(),
             health_check: HealthCheckConfig::default(),
+            timeout_ms: 5000,
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
         }
     }
 
@@ -234,8 +249,30 @@ mod tests {
     }
 
     #[test]
+    fn skips_backend_with_open_circuit() {
+        // Este es el punto de la Fase 3: aunque el health checker diga
+        // que "a" está HEALTHY (nunca lo tocamos), si su circuit breaker
+        // está OPEN por fallos reales de tráfico, select() lo tiene que
+        // esquivar igual que a uno unhealthy.
+        let pool = UpstreamPool::new("test".into(), &upstream_config(&["http://a", "http://b"]));
+
+        let threshold = CircuitBreakerConfig::default().failure_threshold;
+        for _ in 0..threshold {
+            pool.backends()[0].circuit.record_failure();
+        }
+        assert!(
+            pool.backends()[0].is_healthy(),
+            "sigue healthy, sólo el circuito está abierto"
+        );
+
+        let selections: Vec<String> = (0..4).map(|_| pool.select().unwrap().url.clone()).collect();
+
+        assert!(selections.iter().all(|s| s == "http://b"));
+    }
+
+    #[test]
     fn backend_becomes_unhealthy_after_threshold_failures() {
-        let backend = Backend::new("http://a".into());
+        let backend = Backend::new("http://a".into(), &CircuitBreakerConfig::default());
         assert!(backend.is_healthy());
 
         assert_eq!(backend.record_check_result(false, 2, 3), None);
@@ -247,7 +284,7 @@ mod tests {
 
     #[test]
     fn backend_does_not_flap_on_single_failure() {
-        let backend = Backend::new("http://a".into());
+        let backend = Backend::new("http://a".into(), &CircuitBreakerConfig::default());
 
         // Un solo fallo no debe tumbar el backend (threshold=3)
         assert_eq!(backend.record_check_result(false, 2, 3), None);
@@ -260,7 +297,7 @@ mod tests {
 
     #[test]
     fn backend_recovers_after_threshold_successes() {
-        let backend = Backend::new("http://a".into());
+        let backend = Backend::new("http://a".into(), &CircuitBreakerConfig::default());
         backend.healthy.store(false, Ordering::Relaxed);
 
         assert_eq!(backend.record_check_result(true, 2, 3), None);

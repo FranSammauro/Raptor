@@ -53,9 +53,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&config.server.address).await?;
     tracing::info!(address = %config.server.address, "raptor listening");
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: cuando llega SIGINT o SIGTERM, axum deja de
+    // aceptar conexiones nuevas pero espera a que terminen las que ya
+    // estaban en curso antes de cortar el proceso. Nada de matar
+    // requests a mitad de camino porque a alguien se le ocurrió hacer
+    // un deploy.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    tracing::info!("raptor se apagó prolijamente, nos vemos");
 
     Ok(())
+}
+
+/// Espera a SIGINT (ctrl+c) o SIGTERM (lo que manda systemd/docker/k8s
+/// al parar un contenedor) y devuelve el control. En Windows sólo queda
+/// ctrl+c porque ahí ni SIGTERM ni Unix signals existen tal cual.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("no se pudo instalar el handler de ctrl+c");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("no se pudo instalar el handler de SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("señal de apagado recibida, drenando conexiones en curso...");
 }
 
 fn init_tracing(level: &str) {

@@ -17,6 +17,13 @@ routes:
 upstreams:
   users:
     load_balancer: round_robin
+    timeout_ms: 5000
+    retry:
+      max_attempts: 2
+      backoff_ms: 100
+    circuit_breaker:
+      failure_threshold: 5
+      open_duration_secs: 30
     health_check:
       path: /health
       interval_secs: 10

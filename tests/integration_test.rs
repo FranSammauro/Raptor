@@ -14,7 +14,10 @@ use axum::routing::any;
 use axum::Router as AxumRouter;
 use http_body_util::BodyExt;
 use raptor::balancer::UpstreamManager;
-use raptor::config::{HealthCheckConfig, LoadBalancerStrategy, RouteConfig, UpstreamConfig};
+use raptor::config::{
+    CircuitBreakerConfig, HealthCheckConfig, LoadBalancerStrategy, RetryConfig, RouteConfig,
+    UpstreamConfig,
+};
 use raptor::proxy::AppState;
 use raptor::router::Router as RaptorRouter;
 use serde_json::{json, Value};
@@ -62,6 +65,28 @@ fn upstream_config(servers: Vec<String>) -> UpstreamConfig {
         load_balancer: LoadBalancerStrategy::RoundRobin,
         servers,
         health_check: HealthCheckConfig::default(),
+        timeout_ms: 5000,
+        retry: RetryConfig::default(),
+        circuit_breaker: CircuitBreakerConfig::default(),
+    }
+}
+
+/// Variante con timeout/retry/circuit breaker a mano, para los tests
+/// que necesitan que las cosas pasen rápido (nadie quiere un test suite
+/// que tarde 5 segundos por el timeout default de producción).
+fn upstream_config_with(
+    servers: Vec<String>,
+    timeout_ms: u64,
+    retry: RetryConfig,
+    circuit_breaker: CircuitBreakerConfig,
+) -> UpstreamConfig {
+    UpstreamConfig {
+        load_balancer: LoadBalancerStrategy::RoundRobin,
+        servers,
+        health_check: HealthCheckConfig::default(),
+        timeout_ms,
+        retry,
+        circuit_breaker,
     }
 }
 
@@ -291,6 +316,180 @@ async fn propagates_x_request_id_header_to_upstream() {
 
     let request_id = json["x_request_id"].as_str().unwrap();
     assert!(uuid::Uuid::parse_str(request_id).is_ok());
+}
+
+#[tokio::test]
+async fn retries_against_a_different_backend_when_first_is_unreachable() {
+    // El primer server de la lista no tiene nada escuchando; el segundo
+    // sí. Con max_attempts=2, el segundo intento (que cae en el otro
+    // backend gracias al cursor de Round Robin) tiene que salvar el
+    // request.
+    let healthy_addr = spawn_test_backend("users-healthy").await;
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        upstream_config_with(
+            vec!["http://127.0.0.1:1".to_string(), healthy_addr],
+            2000,
+            RetryConfig {
+                max_attempts: 2,
+                backoff_ms: 10,
+            },
+            CircuitBreakerConfig::default(),
+        ),
+    );
+
+    let app = build_raptor_app(
+        vec![RouteConfig {
+            path: "/api/users".to_string(),
+            upstream: "users".to_string(),
+        }],
+        upstreams,
+    );
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    assert_eq!(json["backend_id"], "users-healthy");
+}
+
+#[tokio::test]
+async fn does_not_retry_non_idempotent_methods() {
+    // POST no es retryable aunque el upstream pida max_attempts=3: un
+    // solo intento, y si falla, falla. No queremos duplicar un alta por
+    // las dudas.
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        upstream_config_with(
+            vec!["http://127.0.0.1:1".to_string()],
+            2000,
+            RetryConfig {
+                max_attempts: 3,
+                backoff_ms: 10,
+            },
+            CircuitBreakerConfig::default(),
+        ),
+    );
+
+    let app = build_raptor_app(
+        vec![RouteConfig {
+            path: "/api/users".to_string(),
+            upstream: "users".to_string(),
+        }],
+        upstreams,
+    );
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/users")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn returns_504_when_backend_exceeds_timeout() {
+    // Backend de mentira que nunca contesta (nunca hace .await sobre la
+    // conexión, así que del otro lado sólo ve silencio). Con timeout_ms
+    // bajo, Raptor lo tiene que cortar solo y devolver 504.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Aceptamos la conexión y no contestamos nada, nunca.
+                // El cliente HTTP de Raptor se va a quedar esperando
+                // hasta que el timeout lo mate.
+                std::mem::forget(stream);
+            }
+        }
+    });
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        upstream_config_with(
+            vec![format!("http://{addr}")],
+            300, // timeout bien corto para no hacer esperar al test suite
+            RetryConfig::default(),
+            CircuitBreakerConfig::default(),
+        ),
+    );
+
+    let app = build_raptor_app(
+        vec![RouteConfig {
+            path: "/api/users".to_string(),
+            upstream: "users".to_string(),
+        }],
+        upstreams,
+    );
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn circuit_breaker_opens_after_repeated_real_failures() {
+    // Con failure_threshold=2, dos requests fallidos seguidos contra el
+    // único backend del upstream tienen que abrir su circuito. El
+    // tercer request ya ni intenta conectar (el circuito lo frena antes)
+    // y cae directo a "no healthy backend available".
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        upstream_config_with(
+            vec!["http://127.0.0.1:1".to_string()],
+            500,
+            RetryConfig::default(), // sin retries, para aislar el circuito
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_duration_secs: 30,
+            },
+        ),
+    );
+
+    let app = build_raptor_app(
+        vec![RouteConfig {
+            path: "/api/users".to_string(),
+            upstream: "users".to_string(),
+        }],
+        upstreams,
+    );
+
+    for _ in 0..2 {
+        let req = Request::builder()
+            .uri("/api/users/1")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // Circuito abierto: ahora el pool ni siquiera puede seleccionar este
+    // backend, así que la respuesta cambia a 503 (pool sin backends
+    // disponibles) en vez de 502 (fallo real de conexión).
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

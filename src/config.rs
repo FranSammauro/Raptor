@@ -88,6 +88,65 @@ impl Default for HealthCheckConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct RetryConfig {
+    /// Cantidad total de intentos, incluyendo el primero. 1 = sin retries.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Espera fija entre reintentos. Nada del otro mundo, para
+    /// exponential backoff con jitter esperá a la Fase 6.
+    #[serde(default = "default_backoff_ms")]
+    pub backoff_ms: u64,
+}
+
+fn default_max_attempts() -> u32 {
+    1
+}
+fn default_backoff_ms() -> u64 {
+    100
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            backoff_ms: default_backoff_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Fallos consecutivos (a nivel request real, no health check) para
+    /// que el circuito de un backend pase a OPEN.
+    #[serde(default = "default_cb_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Cuánto se queda en OPEN antes de dejar pasar un request de prueba
+    /// (HALF-OPEN).
+    #[serde(default = "default_cb_open_duration_secs")]
+    pub open_duration_secs: u64,
+}
+
+fn default_cb_failure_threshold() -> u32 {
+    5
+}
+fn default_cb_open_duration_secs() -> u64 {
+    30
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_cb_failure_threshold(),
+            open_duration_secs: default_cb_open_duration_secs(),
+        }
+    }
+}
+
+fn default_timeout_ms() -> u64 {
+    5000
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct UpstreamConfig {
     #[serde(default)]
     pub load_balancer: LoadBalancerStrategy,
@@ -95,6 +154,15 @@ pub struct UpstreamConfig {
     pub servers: Vec<String>,
     #[serde(default)]
     pub health_check: HealthCheckConfig,
+    /// Timeout por request hacia el backend. Si se cumple, cuenta como
+    /// fallo para el circuit breaker y dispara un 504 (o un retry, si
+    /// queda presupuesto).
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -196,6 +264,21 @@ impl Config {
             if upstream.health_check.unhealthy_threshold == 0 {
                 return Err(ConfigError::Invalid(format!(
                     "unhealthy_threshold del upstream '{name}' debe ser mayor a 0"
+                )));
+            }
+            if upstream.timeout_ms == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "timeout_ms del upstream '{name}' debe ser mayor a 0"
+                )));
+            }
+            if upstream.retry.max_attempts == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "retry.max_attempts del upstream '{name}' debe ser al menos 1"
+                )));
+            }
+            if upstream.circuit_breaker.failure_threshold == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "circuit_breaker.failure_threshold del upstream '{name}' debe ser mayor a 0"
                 )));
             }
         }
