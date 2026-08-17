@@ -1,5 +1,11 @@
 server:
   address: 0.0.0.0:8080
+  # Descomentar para servir HTTPS en vez de HTTP plano. Certificado y key
+  # se cargan una sola vez al arrancar (sin reload en caliente todavía,
+  # eso es Fase 6).
+  # tls:
+  #   cert_path: /etc/raptor/certs/fullchain.pem
+  #   key_path: /etc/raptor/certs/privkey.pem
 
 logging:
   level: info
@@ -7,12 +13,32 @@ logging:
 routes:
   - path: /api/users
     upstream: users
+    # Sin `auth`, la ruta queda pública. Sin `rate_limit`, sin tope.
 
   - path: /api/auth
     upstream: auth
+    rate_limit:
+      requests: 20
+      window_secs: 60
 
   - path: /api/files
     upstream: files
+    auth:
+      type: api_key
+      header: X-API-Key
+      keys:
+        - "clave-de-ejemplo-cambiar-en-produccion"
+
+  - path: /api/admin
+    upstream: users
+    auth:
+      type: jwt
+      secret: "otro-secreto-que-hay-que-cambiar"
+      issuer: raptor-auth
+      audience: raptor-api
+    rate_limit:
+      requests: 5
+      window_secs: 60
 
 upstreams:
   users:

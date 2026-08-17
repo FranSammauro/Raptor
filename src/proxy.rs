@@ -1,19 +1,17 @@
 //! Núcleo del reverse proxy.
 //!
-//! Fase 3 le suma reliability a lo que ya andaba: cada request hacia un
-//! backend tiene timeout, si falla se reintenta (con presupuesto limitado
-//! y sólo para métodos idempotentes, ojo) contra OTRO backend del mismo
-//! upstream, y cada fallo/timeout alimenta el circuit breaker de ese
-//! backend puntual. Nada de esto toca el health checker de la Fase 2:
-//! son dos mecanismos que conviven, cada uno mirando una cosa distinta
-//! (ver comentario largo en circuit.rs si querés el porqué).
+//! Fase 4 le agrega la parte de seguridad: antes de que un request llegue
+//! siquiera a elegir backend, pasa por auth (si la ruta la pide) y por
+//! rate limiting (si la ruta lo tiene configurado). Recién ahí entra al
+//! mismo loop de reintentos que ya andaba desde la Fase 3.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::{HeaderValue, Method, StatusCode, Uri};
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -21,7 +19,9 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use uuid::Uuid;
 
+use crate::auth::{self, AuthError};
 use crate::balancer::{Backend, UpstreamManager, UpstreamPool};
+use crate::config::AuthConfig;
 use crate::router::Router;
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -32,18 +32,43 @@ pub struct AppState {
     pub router: Arc<Router>,
     pub upstreams: Arc<UpstreamManager>,
     pub client: HttpClient,
+    /// Para armar X-Forwarded-Proto sin que cada handler tenga que
+    /// adivinar si estamos atrás de TLS o no.
+    pub scheme: &'static str,
 }
 
 impl AppState {
     pub fn new(router: Router, upstreams: UpstreamManager) -> Self {
-        let client: HttpClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+        Self::new_with_scheme(router, upstreams, "http")
+    }
+
+    pub fn new_with_scheme(router: Router, upstreams: UpstreamManager, scheme: &'static str) -> Self {
+        let client: HttpClient =
+            Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         Self {
             router: Arc::new(router),
             upstreams: Arc::new(upstreams),
             client,
+            scheme,
         }
     }
 }
+
+/// Headers hop-by-hop según RFC 7230 (más `keep-alive`, que en la
+/// práctica también aparece dando vueltas). Estos son headers que hablan
+/// de la conexión TCP puntual entre el cliente y Raptor -- no tienen
+/// ningún sentido reenviárselos al backend, que tiene su propia conexión
+/// TCP con Raptor.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// Con cuáles métodos nos animamos a reintentar. La regla de dedo es:
 /// si repetir el request no le puede generar un dolor de cabeza al
@@ -66,13 +91,18 @@ enum AttemptFailure {
     ConnectError,
 }
 
-/// Handler catch-all: matchea la ruta, resuelve el upstream, y ejecuta el
-/// loop de intentos contra el pool de backends.
-pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+/// Handler catch-all: matchea la ruta, valida auth y rate limit, resuelve
+/// el upstream, y ejecuta el loop de intentos contra el pool de backends.
+pub async fn handle(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    req: axum::extract::Request,
+) -> Response {
     let start = Instant::now();
     let request_id = Uuid::new_v4();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let client_ip: Option<IpAddr> = connect_info.map(|ConnectInfo(addr)| addr.ip());
 
     let route = match state.router.match_route(&path) {
         Some(route) => route.clone(),
@@ -81,6 +111,34 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
             return (StatusCode::NOT_FOUND, "no matching route").into_response();
         }
     };
+
+    if let Some(auth_config) = &route.auth {
+        if let Err(err) = check_auth(auth_config, req.headers()) {
+            tracing::warn!(
+                request_id = %request_id, %method, %path,
+                error = %err, "auth rechazada"
+            );
+            return (StatusCode::UNAUTHORIZED, err.to_string()).into_response();
+        }
+    }
+
+    if route.rate_limit.is_some() {
+        // Si no hay ConnectInfo (pasa en algunos setups de test, o
+        // detrás de según qué balanceador raro), todos los clientes sin
+        // IP identificable comparten un único balde. No es ideal, pero
+        // es mejor eso que reventar el handler.
+        let client_id = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+        if let Some(limiter) = state.router.rate_limiter_for(&route.path) {
+            if !limiter.check(&client_id) {
+                tracing::warn!(
+                    request_id = %request_id, %method, %path,
+                    client_id, "rate limit excedido"
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+            }
+        }
+    }
 
     let pool = match state.upstreams.get(&route.upstream) {
         Some(pool) => pool,
@@ -97,11 +155,12 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
         }
     };
 
+    let (mut parts, body) = req.into_parts();
+
     // El body sólo se puede leer una vez, así que lo bufferizamos antes
     // de entrar al loop de reintentos. Para requests con body gigante
     // esto no es ideal (va todo a memoria), pero streamear un retry es
     // un quilombo mayor y queda fuera del alcance de esta fase.
-    let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
@@ -109,6 +168,14 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
             return (StatusCode::BAD_REQUEST, "could not read request body").into_response();
         }
     };
+
+    let original_host = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    sanitize_and_augment_headers(&mut parts.headers, client_ip, state.scheme);
 
     let max_attempts = if is_retryable_method(&method) {
         pool.retry.max_attempts
@@ -134,21 +201,13 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
             &parts,
             &body_bytes,
             request_id,
+            original_host.as_deref(),
         )
         .await
         {
             Ok(response) => {
                 backend.circuit.record_success();
-                log_success(
-                    request_id,
-                    &method,
-                    &path,
-                    &route.upstream,
-                    &backend,
-                    &response,
-                    start,
-                    attempt,
-                );
+                log_success(request_id, &method, &path, &route.upstream, &backend, &response, start, attempt);
                 return response;
             }
             Err(failure) => {
@@ -177,10 +236,9 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
 
     let elapsed = start.elapsed();
     let (status, message) = match last_failure {
-        AttemptFailure::NoBackendAvailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no healthy backend available",
-        ),
+        AttemptFailure::NoBackendAvailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, "no healthy backend available")
+        }
         AttemptFailure::Timeout => (StatusCode::GATEWAY_TIMEOUT, "upstream timeout"),
         AttemptFailure::ConnectError => (StatusCode::BAD_GATEWAY, "upstream unreachable"),
     };
@@ -193,6 +251,46 @@ pub async fn handle(State(state): State<AppState>, req: axum::extract::Request) 
     );
 
     (status, message).into_response()
+}
+
+/// Valida las credenciales del request contra lo que pide la ruta.
+fn check_auth(auth_config: &AuthConfig, headers: &HeaderMap) -> Result<(), AuthError> {
+    match auth_config {
+        AuthConfig::ApiKey { header, keys } => auth::verify_api_key(headers, header, keys),
+        AuthConfig::Jwt {
+            secret,
+            issuer,
+            audience,
+        } => auth::verify_jwt(headers, secret, issuer.as_deref(), audience.as_deref()),
+    }
+}
+
+/// Saca los headers hop-by-hop y agrega/actualiza los `X-Forwarded-*`.
+/// Se hace una sola vez por request (no por intento de retry), porque
+/// esta parte no depende de a qué backend puntual terminemos pegándole.
+fn sanitize_and_augment_headers(headers: &mut HeaderMap, client_ip: Option<IpAddr>, scheme: &str) {
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(*name);
+    }
+
+    if let Some(ip) = client_ip {
+        let header_name = HeaderName::from_static("x-forwarded-for");
+        let new_value = match headers.get(&header_name).and_then(|v| v.to_str().ok()) {
+            // Si ya venía un X-Forwarded-For (porque Raptor está detrás
+            // de otro proxy/balanceador), le sumamos nuestra IP al final
+            // de la cadena en vez de pisarlo -- así no se pierde el
+            // rastro del cliente original.
+            Some(existing) => format!("{existing}, {ip}"),
+            None => ip.to_string(),
+        };
+        if let Ok(value) = HeaderValue::from_str(&new_value) {
+            headers.insert(header_name, value);
+        }
+    }
+
+    if let Ok(value) = HeaderValue::from_str(scheme) {
+        headers.insert(HeaderName::from_static("x-forwarded-proto"), value);
+    }
 }
 
 fn log_success(
@@ -228,6 +326,7 @@ async fn attempt_forward(
     parts: &axum::http::request::Parts,
     body_bytes: &Bytes,
     request_id: Uuid,
+    original_host: Option<&str>,
 ) -> Result<Response, AttemptFailure> {
     let path_and_query = parts
         .uri
@@ -239,14 +338,38 @@ async fn attempt_forward(
         .parse()
         .map_err(|_| AttemptFailure::ConnectError)?;
 
+    let backend_authority = new_uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_default();
+
     let mut builder = axum::http::Request::builder()
         .method(parts.method.clone())
         .uri(new_uri)
         .version(parts.version);
 
     for (name, value) in parts.headers.iter() {
+        // El Host lo seteamos después, apuntando al backend -- no tiene
+        // sentido mandarle al backend el Host que puso el cliente
+        // original (podría ni resolver, y varios frameworks HTTP se
+        // portan raro si el Host no matchea con quien realmente los
+        // está atendiendo).
+        if name == axum::http::header::HOST {
+            continue;
+        }
         builder = builder.header(name, value);
     }
+
+    if !backend_authority.is_empty() {
+        builder = builder.header(axum::http::header::HOST, &backend_authority);
+    }
+
+    if let Some(host) = original_host {
+        if let Ok(value) = HeaderValue::from_str(host) {
+            builder = builder.header(HeaderName::from_static("x-forwarded-host"), value);
+        }
+    }
+
     // Propagamos el request id para permitir tracing distribuido
     // (Fase 5: Observability).
     builder = builder.header(
@@ -271,10 +394,7 @@ async fn attempt_forward(
                 .collect()
                 .await
                 .map_err(|_| AttemptFailure::ConnectError)?;
-            Ok(Response::from_parts(
-                resp_parts,
-                Body::from(collected.to_bytes()),
-            ))
+            Ok(Response::from_parts(resp_parts, Body::from(collected.to_bytes())))
         }
     }
 }

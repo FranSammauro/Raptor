@@ -8,11 +8,15 @@ description = "Raptor - Reverse Proxy / API Gateway de alto rendimiento"
 name = "raptor"
 path = "src/main.rs"
 
+[features]
+test-utils = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "server-auto", "tokio"] }
+tower-service = "0.3"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -23,6 +27,14 @@ thiserror = "1"
 indexmap = "=2.2.6"
 getrandom = "=0.2.15"
 futures-util = "0.3"
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
+rustls = "0.21"
+tokio-rustls = "0.24"
+rustls-pemfile = "1"
+zeroize = "=1.7.0"
 
 [profile.release]
 opt-level = 3
@@ -30,4 +42,4 @@ lto = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-serde_json = "1"
+raptor = { path = ".", features = ["test-utils"] }

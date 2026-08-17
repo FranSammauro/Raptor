@@ -22,8 +22,9 @@ pub fn spawn_health_checks(manager: Arc<UpstreamManager>, client: HttpClient) {
         let client = client.clone();
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(pool.health_check.interval_secs.max(1)));
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                pool.health_check.interval_secs.max(1),
+            ));
 
             loop {
                 interval.tick().await;
@@ -33,7 +34,10 @@ pub fn spawn_health_checks(manager: Arc<UpstreamManager>, client: HttpClient) {
     }
 }
 
-async fn check_all_backends(pool: &crate::balancer::UpstreamPool, client: &HttpClient) {
+async fn check_all_backends(
+    pool: &crate::balancer::UpstreamPool,
+    client: &HttpClient,
+) {
     let checks = pool.backends().iter().map(|backend| {
         let backend = backend.clone();
         let client = client.clone();

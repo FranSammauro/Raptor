@@ -11,9 +11,58 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    /// Path al certificado en formato PEM (puede incluir la cadena completa).
+    pub cert_path: String,
+    /// Path a la private key en formato PEM.
+    pub key_path: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     /// Dirección donde Raptor escucha, ej: "0.0.0.0:8080"
     pub address: String,
+    /// Si está presente, Raptor termina TLS en este listener. Si no,
+    /// sirve HTTP plano nomás. SNI, reload de certificados en caliente y
+    /// HTTPS hacia los upstreams quedan para la Fase 6 -- por ahora es
+    /// un solo cert/key fijo, cargado una vez al arrancar.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    /// Cantidad de requests permitidos por ventana.
+    pub requests: u32,
+    /// Tamaño de la ventana, en segundos.
+    pub window_secs: u64,
+}
+
+/// Cómo se autentica una ruta. Si `RouteConfig::auth` es `None`, la ruta
+/// es pública -- cualquiera pasa, como en las Fases 1 a 3.
+///
+/// El campo `type` en el YAML decide la variante (serde adjacently
+/// tagged, básicamente "fijate el campo type y ahí sabés qué forma
+/// esperar del resto").
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthConfig {
+    ApiKey {
+        #[serde(default = "default_api_key_header")]
+        header: String,
+        keys: Vec<String>,
+    },
+    Jwt {
+        secret: String,
+        #[serde(default)]
+        issuer: Option<String>,
+        #[serde(default)]
+        audience: Option<String>,
+    },
+}
+
+fn default_api_key_header() -> String {
+    "X-API-Key".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -22,6 +71,15 @@ pub struct RouteConfig {
     pub path: String,
     /// Nombre del upstream (clave dentro de `Config::upstreams`), ej: "users"
     pub upstream: String,
+    /// Si está seteado, todo request a esta ruta tiene que autenticarse
+    /// primero. Si no está, la ruta es pública.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+    /// Rate limit propio de esta ruta (token bucket por IP de cliente).
+    /// Si no está seteado, no hay límite -- cuidado con eso en rutas
+    /// públicas y caras de servir.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Estrategia de balanceo de carga para un upstream.
@@ -163,6 +221,16 @@ pub struct UpstreamConfig {
     pub retry: RetryConfig,
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    /// Por default, Raptor rechaza en la config cualquier server que
+    /// apunte a un rango link-local (169.254.0.0/16). No es paranoia
+    /// porque sí: esa es la dirección que usan AWS/GCP/Azure para el
+    /// endpoint de metadata del cloud (169.254.169.254), y un typo en
+    /// un YAML no debería terminar exponiendo eso a través del proxy.
+    /// Direcciones privadas "normales" (10.x, 172.16.x, 192.168.x) y
+    /// localhost siguen totalmente permitidas -- son el caso de uso de
+    /// toda la vida para backends internos.
+    #[serde(default)]
+    pub allow_link_local_upstreams: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -221,10 +289,11 @@ impl Config {
             source,
         })?;
 
-        let config: Config = serde_yaml::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: path_str.clone(),
-            source,
-        })?;
+        let config: Config =
+            serde_yaml::from_str(&raw).map_err(|source| ConfigError::Parse {
+                path: path_str.clone(),
+                source,
+            })?;
 
         config.validate()?;
         Ok(config)
@@ -254,6 +323,21 @@ impl Config {
                     return Err(ConfigError::Invalid(format!(
                         "el servidor '{server}' del upstream '{name}' debe ser una URL http(s) válida"
                     )));
+                }
+                if !upstream.allow_link_local_upstreams {
+                    if let Some(host) = extract_host(server) {
+                        if let Ok(std::net::IpAddr::V4(ipv4)) = host.parse::<std::net::IpAddr>() {
+                            if ipv4.is_link_local() {
+                                return Err(ConfigError::Invalid(format!(
+                                    "el servidor '{server}' del upstream '{name}' apunta a una \
+                                     dirección link-local (169.254.0.0/16) -- típicamente el \
+                                     endpoint de metadata del cloud. Si es realmente lo que \
+                                     querés, seteá 'allow_link_local_upstreams: true' en el \
+                                     upstream"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             if upstream.health_check.healthy_threshold == 0 {
@@ -299,5 +383,98 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// Parseo bien de bolsillo para sacar el host de una URL tipo
+/// "http://10.0.0.5:3001/algo". No usamos la crate `url` para no sumar
+/// otra dependencia sólo para esto -- nuestras URLs de config son
+/// siempre simples (esquema + host + puerto opcional), así que un split
+/// a mano alcanza y sobra.
+fn extract_host(url: &str) -> Option<&str> {
+    let after_scheme = url.split("://").nth(1)?;
+    let host_port = after_scheme.split('/').next()?;
+    host_port.split(':').next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_upstream(servers: Vec<&str>) -> UpstreamConfig {
+        UpstreamConfig {
+            load_balancer: LoadBalancerStrategy::RoundRobin,
+            servers: servers.into_iter().map(|s| s.to_string()).collect(),
+            health_check: HealthCheckConfig::default(),
+            timeout_ms: 5000,
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            allow_link_local_upstreams: false,
+        }
+    }
+
+    fn minimal_config(upstream: UpstreamConfig) -> Config {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("svc".to_string(), upstream);
+
+        Config {
+            server: ServerConfig {
+                address: "0.0.0.0:8080".to_string(),
+                tls: None,
+            },
+            routes: vec![RouteConfig {
+                path: "/api".to_string(),
+                upstream: "svc".to_string(),
+                auth: None,
+                rate_limit: None,
+            }],
+            upstreams,
+            logging: LoggingConfig::default(),
+        }
+    }
+
+    #[test]
+    fn rejects_link_local_upstream_by_default() {
+        // 169.254.169.254 es el clásico endpoint de metadata del cloud
+        // (AWS/GCP/Azure) -- si esto se cuela en un YAML, probablemente
+        // sea un typo copiado de algún lado y no lo que alguien quiso
+        // escribir a propósito.
+        let config = minimal_config(minimal_upstream(vec!["http://169.254.169.254"]));
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn allows_link_local_upstream_when_explicitly_enabled() {
+        let mut upstream = minimal_upstream(vec!["http://169.254.169.254"]);
+        upstream.allow_link_local_upstreams = true;
+        let config = minimal_config(upstream);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn allows_ordinary_private_and_loopback_upstreams() {
+        // Esto es el caso de uso de toda la vida: backends en la red
+        // interna. Nada de esto debería activar el guard de link-local.
+        let config = minimal_config(minimal_upstream(vec![
+            "http://10.0.0.5:3001",
+            "http://192.168.1.20:3001",
+            "http://127.0.0.1:3001",
+            "http://localhost:3001",
+        ]));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_upstream_without_servers() {
+        let config = minimal_config(minimal_upstream(vec![]));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn extract_host_handles_scheme_port_and_path() {
+        assert_eq!(extract_host("http://10.0.0.5:3001/algo"), Some("10.0.0.5"));
+        assert_eq!(extract_host("https://example.com"), Some("example.com"));
+        assert_eq!(extract_host("http://localhost:8080"), Some("localhost"));
     }
 }

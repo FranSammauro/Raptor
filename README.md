@@ -5,7 +5,36 @@ Reverse Proxy / API Gateway de alto rendimiento, escrito en Rust.
 Ver [informe técnico completo](docs/architecture.md) para el diseño conceptual
 y el roadmap de fases.
 
-## Estado actual: Fase 3 — Reliability
+## Estado actual: Fase 4 — Security
+
+- [x] Rate limiting con Token Bucket, configurable por ruta, un balde por
+      cliente (IP)
+- [x] Autenticación por API Key (header configurable)
+- [x] Autenticación por JWT (HS256), implementado a mano: valida firma,
+      `exp`, `nbf`, `iss` y `aud`
+- [x] TLS termination con `tokio-rustls` (listener manual, ver nota más
+      abajo sobre por qué no se usó `axum-server`)
+- [x] Header sanitization: se descartan los headers hop-by-hop antes de
+      reenviar (`Connection`, `Transfer-Encoding`, etc.), se reescribe
+      `Host` apuntando al backend, y se arma correctamente
+      `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host`
+- [x] Guard de SSRF en la configuración: rechaza upstreams apuntando a
+      rango link-local (169.254.0.0/16 — el endpoint de metadata típico
+      de AWS/GCP/Azure) salvo que se habilite explícitamente
+- [x] Unit tests (rate limiter, auth, guard SSRF) + integration tests
+      end-to-end (401/429, headers no reenviados) + TLS 1.3 verificado a
+      mano con `openssl s_client`
+
+**Nota técnica — TLS:** la idea original era usar `axum-server` con la
+feature `tls-rustls` (dos líneas y listo), pero la versión 0.6.0 tiene un
+bug de compatibilidad de tipos con las versiones de axum/hyper-util de
+este proyecto. En vez de perseguir la combinación exacta de versiones que
+sí compila, se implementó el listener TLS a mano en `src/tls.rs` con
+`tokio-rustls` — es básicamente lo mismo que hace `axum-server` por
+dentro, sin la dependencia extra. SNI, reload de certificados en caliente
+y HTTPS hacia los upstreams quedan para la Fase 6.
+
+### Fase 3 — Reliability ✅
 
 - [x] Timeout configurable por upstream (`timeout_ms`), aplicado a cada
       intento individual contra un backend
@@ -65,6 +94,14 @@ Ver sección "Fase 1 — Core ✅" más abajo para el detalle de esa fase.
   | `indexmap` | `=2.2.6` | Versiones ≥2.3 requieren `edition2024` |
   | `getrandom` | `=0.2.15` | `getrandom` 0.4.x requiere `edition2024` |
   | `uuid` | `=1.10.0` | Versiones más nuevas tiran de `getrandom` 0.4 |
+  | `zeroize` | `=1.7.0` | Versiones ≥1.8 requieren `edition2024` |
+  | `hyper-util` | `0.1` (rango normal) | Sin pin — ver nota sobre TLS |
+
+  **Sobre TLS:** no se usa `axum-server` (ver nota en la sección de
+  Fase 4 más abajo) por un bug de compatibilidad de tipos ajeno al MSRV,
+  no por el toolchain viejo. `rustls`, `tokio-rustls` y `rustls-pemfile`
+  se fijaron en sus versiones `0.21` / `0.24` / `1.x` porque son las que
+  acompañan a ese ecosistema sin pedir `edition2024`.
 
   **Si compilás con un toolchain más nuevo (1.80+)**, estos pines no son
   necesarios — podés relajarlos a rangos normales (`"1"`, `"2"`, etc.) sin
@@ -149,6 +186,70 @@ Cada intento adicional selecciona un backend distinto del mismo upstream
 (vía el cursor de Round Robin), así que un reintento típico termina
 yendo a otro servidor, no al mismo que ya falló.
 
+### Seguridad (Fase 4)
+
+```yaml
+server:
+  address: 0.0.0.0:8443
+  tls:                        # opcional -- si no está, sirve HTTP plano
+    cert_path: /etc/raptor/certs/fullchain.pem
+    key_path: /etc/raptor/certs/privkey.pem
+
+routes:
+  - path: /api/files
+    upstream: files
+    auth:
+      type: api_key
+      header: X-API-Key       # default si se omite: "X-API-Key"
+      keys:
+        - "clave-de-ejemplo"
+
+  - path: /api/admin
+    upstream: users
+    auth:
+      type: jwt
+      secret: "secreto-compartido"
+      issuer: raptor-auth     # opcional
+      audience: raptor-api    # opcional
+    rate_limit:
+      requests: 5
+      window_secs: 60
+
+upstreams:
+  users:
+    # ...
+    allow_link_local_upstreams: false   # default. Ver nota SSRF abajo
+```
+
+**Auth por ruta:** si una ruta no tiene `auth`, queda pública (igual que
+en fases anteriores). `api_key` compara contra una lista fija de keys
+válidas. `jwt` valida HS256: firma, `exp`, `nbf` (si vienen), y `iss`/
+`aud` si se configuraron. Raptor sólo *valida* tokens, nunca los emite —
+la emisión es responsabilidad de otro servicio (un auth service, un IdP,
+lo que sea).
+
+**Rate limiting:** Token Bucket por ruta, con un balde independiente por
+IP de cliente. `requests` fichas se recargan de forma continua a razón de
+`requests / window_secs` por segundo (no es "N requests exactos por
+minuto natural", es una tasa sostenida). Sin `rate_limit` configurado, la
+ruta no tiene límite.
+
+**Header sanitization:** antes de reenviar, Raptor descarta los headers
+hop-by-hop (`Connection`, `Transfer-Encoding`, `Upgrade`, etc. — ver RFC
+7230) y reescribe `Host` para que apunte al backend en vez de al host que
+puso el cliente original. También arma `X-Forwarded-For` (agregando la
+IP del cliente a la cadena si ya venía una, en vez de pisarla),
+`X-Forwarded-Proto` y `X-Forwarded-Host`.
+
+**SSRF:** como el destino de cada request siempre sale de la
+configuración estática (nunca de un path/header que mande el cliente), el
+SSRF clásico — engañar al proxy para que le pegue a una URL elegida por
+un atacante — no aplica estructuralmente en este diseño. Lo que sí valida
+la config es un descuido más mundano: que ningún upstream apunte por
+error al rango link-local (`169.254.0.0/16`), la dirección que usan
+AWS/GCP/Azure para el endpoint de metadata. Direcciones privadas
+normales y `localhost` siguen totalmente permitidas.
+
 ## Testing
 
 ```bash
@@ -158,7 +259,9 @@ cargo test
 Los integration tests (`tests/integration_test.rs`) levantan un backend HTTP
 de prueba en un puerto efímero y ejercitan la app de Raptor completa vía
 `tower::ServiceExt::oneshot` — no dependen de procesos externos ni de
-scripts, así que corren igual en tu máquina que en CI.
+scripts, así que corren igual en tu máquina que en CI. TLS se verificó
+aparte, a mano, con un certificado self-signed y `openssl s_client`
+(automatizarlo con fixtures de certificados queda para más adelante).
 
 ## Roadmap
 
@@ -170,7 +273,7 @@ detalle completo de las 7 fases planeadas. Resumen:
       health checks, connection pooling
 - [x] **Fase 3 — Reliability**: timeouts, retries, circuit breaker,
       graceful shutdown
-- [ ] **Fase 4 — Security**: rate limiting, API keys, JWT, TLS, SSRF
+- [x] **Fase 4 — Security**: rate limiting, API keys, JWT, TLS, SSRF
 - [ ] **Fase 5 — Observability**: métricas Prometheus, admin API
 - [ ] **Fase 6 — Advanced**: weighted LB, least connections, config reload,
       dashboard

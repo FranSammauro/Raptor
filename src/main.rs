@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use raptor::balancer::UpstreamManager;
 use raptor::config::Config;
 use raptor::proxy::AppState;
@@ -31,17 +33,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_tracing(&config.logging.level);
 
+    let tls_enabled = config.server.tls.is_some();
+
     tracing::info!(
         config_path = %config_path,
         address = %config.server.address,
         routes = config.routes.len(),
         upstreams = config.upstreams.len(),
+        tls = tls_enabled,
         "starting raptor"
     );
 
     let raptor_router = RaptorRouter::new(config.routes.clone());
     let upstream_manager = UpstreamManager::from_config(&config.upstreams);
-    let state = AppState::new(raptor_router, upstream_manager);
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let state = AppState::new_with_scheme(raptor_router, upstream_manager, scheme);
 
     // Los health checks corren en background durante toda la vida del
     // proceso, actualizando el estado de cada backend de forma lock-free
@@ -53,14 +59,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&config.server.address).await?;
     tracing::info!(address = %config.server.address, "raptor listening");
 
-    // Graceful shutdown: cuando llega SIGINT o SIGTERM, axum deja de
-    // aceptar conexiones nuevas pero espera a que terminen las que ya
-    // estaban en curso antes de cortar el proceso. Nada de matar
-    // requests a mitad de camino porque a alguien se le ocurrió hacer
-    // un deploy.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match &config.server.tls {
+        Some(tls_config) => {
+            let rustls_config = raptor::tls::load_rustls_config(tls_config)?;
+            // El listener TLS a mano no tiene un with_graceful_shutdown
+            // como axum::serve -- es una limitación conocida de haberlo
+            // escrito nosotros (ver comentario largo en tls.rs). Para
+            // esta fase alcanza; si hace falta shutdown prolijo con TLS
+            // de por medio, es una buena tarea para la Fase 6.
+            raptor::tls::serve(listener, rustls_config, app).await;
+        }
+        None => {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        }
+    }
 
     tracing::info!("raptor se apagó prolijamente, nos vemos");
 

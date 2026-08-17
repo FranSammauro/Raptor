@@ -4,12 +4,15 @@
 //! testear la aplicación completa en memoria con `tower::ServiceExt::oneshot`,
 //! sin depender de binding real de sockets ni de procesos externos.
 
+pub mod auth;
 pub mod balancer;
 pub mod circuit;
 pub mod config;
 pub mod health;
 pub mod proxy;
+pub mod ratelimit;
 pub mod router;
+pub mod tls;
 
 use axum::routing::any;
 use axum::Router as AxumRouter;

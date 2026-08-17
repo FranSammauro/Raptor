@@ -163,7 +163,12 @@ impl UpstreamManager {
     pub fn from_config(upstreams: &std::collections::HashMap<String, UpstreamConfig>) -> Self {
         let pools = upstreams
             .iter()
-            .map(|(name, cfg)| (name.clone(), Arc::new(UpstreamPool::new(name.clone(), cfg))))
+            .map(|(name, cfg)| {
+                (
+                    name.clone(),
+                    Arc::new(UpstreamPool::new(name.clone(), cfg)),
+                )
+            })
             .collect();
 
         Self { pools }
@@ -193,6 +198,7 @@ mod tests {
             timeout_ms: 5000,
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
+            allow_link_local_upstreams: false,
         }
     }
 
@@ -203,7 +209,9 @@ mod tests {
             &upstream_config(&["http://a", "http://b", "http://c"]),
         );
 
-        let selections: Vec<String> = (0..6).map(|_| pool.select().unwrap().url.clone()).collect();
+        let selections: Vec<String> = (0..6)
+            .map(|_| pool.select().unwrap().url.clone())
+            .collect();
 
         assert_eq!(
             selections,
@@ -222,13 +230,12 @@ mod tests {
         // health checker ya detectó 3 fallos consecutivos).
         pool.backends()[1].healthy.store(false, Ordering::Relaxed);
 
-        let selections: Vec<String> = (0..4).map(|_| pool.select().unwrap().url.clone()).collect();
+        let selections: Vec<String> = (0..4)
+            .map(|_| pool.select().unwrap().url.clone())
+            .collect();
 
         assert!(!selections.contains(&"http://b".to_string()));
-        assert_eq!(
-            selections,
-            vec!["http://a", "http://c", "http://c", "http://a"]
-        );
+        assert_eq!(selections, vec!["http://a", "http://c", "http://c", "http://a"]);
     }
 
     #[test]
@@ -260,12 +267,11 @@ mod tests {
         for _ in 0..threshold {
             pool.backends()[0].circuit.record_failure();
         }
-        assert!(
-            pool.backends()[0].is_healthy(),
-            "sigue healthy, sólo el circuito está abierto"
-        );
+        assert!(pool.backends()[0].is_healthy(), "sigue healthy, sólo el circuito está abierto");
 
-        let selections: Vec<String> = (0..4).map(|_| pool.select().unwrap().url.clone()).collect();
+        let selections: Vec<String> = (0..4)
+            .map(|_| pool.select().unwrap().url.clone())
+            .collect();
 
         assert!(selections.iter().all(|s| s == "http://b"));
     }

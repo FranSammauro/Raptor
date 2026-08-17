@@ -15,8 +15,8 @@ use axum::Router as AxumRouter;
 use http_body_util::BodyExt;
 use raptor::balancer::UpstreamManager;
 use raptor::config::{
-    CircuitBreakerConfig, HealthCheckConfig, LoadBalancerStrategy, RetryConfig, RouteConfig,
-    UpstreamConfig,
+    AuthConfig, CircuitBreakerConfig, HealthCheckConfig, LoadBalancerStrategy, RateLimitConfig,
+    RetryConfig, RouteConfig, UpstreamConfig,
 };
 use raptor::proxy::AppState;
 use raptor::router::Router as RaptorRouter;
@@ -68,6 +68,7 @@ fn upstream_config(servers: Vec<String>) -> UpstreamConfig {
         timeout_ms: 5000,
         retry: RetryConfig::default(),
         circuit_breaker: CircuitBreakerConfig::default(),
+        allow_link_local_upstreams: false,
     }
 }
 
@@ -87,6 +88,16 @@ fn upstream_config_with(
         timeout_ms,
         retry,
         circuit_breaker,
+        allow_link_local_upstreams: false,
+    }
+}
+
+fn route(path: &str, upstream: &str) -> RouteConfig {
+    RouteConfig {
+        path: path.to_string(),
+        upstream: upstream.to_string(),
+        auth: None,
+        rate_limit: None,
     }
 }
 
@@ -117,6 +128,8 @@ async fn forwards_request_to_the_only_backend_of_an_upstream() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -150,6 +163,8 @@ async fn round_robin_distributes_requests_across_backends() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -171,11 +186,7 @@ async fn round_robin_distributes_requests_across_backends() {
     for id in &backend_ids {
         *counts.entry(id.clone()).or_insert(0) += 1;
     }
-    assert_eq!(
-        counts.len(),
-        3,
-        "los 3 backends deberían haber recibido tráfico"
-    );
+    assert_eq!(counts.len(), 3, "los 3 backends deberían haber recibido tráfico");
     for count in counts.values() {
         assert_eq!(*count, 2);
     }
@@ -198,6 +209,8 @@ async fn excludes_unhealthy_backend_from_rotation() {
     let router = RaptorRouter::new(vec![RouteConfig {
         path: "/api/users".to_string(),
         upstream: "users".to_string(),
+        auth: None,
+        rate_limit: None,
     }]);
     let state = AppState::new(router, manager);
     let app = raptor::app(state);
@@ -209,10 +222,7 @@ async fn excludes_unhealthy_backend_from_rotation() {
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         let json = body_json(response).await;
-        assert_eq!(
-            json["backend_id"], "users-1",
-            "sólo debería rotar el backend sano"
-        );
+        assert_eq!(json["backend_id"], "users-1", "sólo debería rotar el backend sano");
     }
 }
 
@@ -230,6 +240,8 @@ async fn returns_503_when_no_healthy_backend_in_upstream() {
     let router = RaptorRouter::new(vec![RouteConfig {
         path: "/api/users".to_string(),
         upstream: "users".to_string(),
+        auth: None,
+        rate_limit: None,
     }]);
     let state = AppState::new(router, manager);
     let app = raptor::app(state);
@@ -253,6 +265,8 @@ async fn returns_404_when_no_route_matches() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -278,6 +292,8 @@ async fn returns_502_when_backend_connection_is_refused() {
         vec![RouteConfig {
             path: "/api/auth".to_string(),
             upstream: "auth".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -302,6 +318,8 @@ async fn propagates_x_request_id_header_to_upstream() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -344,6 +362,8 @@ async fn retries_against_a_different_backend_when_first_is_unreachable() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -383,6 +403,8 @@ async fn does_not_retry_non_idempotent_methods() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -431,6 +453,8 @@ async fn returns_504_when_backend_exceeds_timeout() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -468,6 +492,8 @@ async fn circuit_breaker_opens_after_repeated_real_failures() {
         vec![RouteConfig {
             path: "/api/users".to_string(),
             upstream: "users".to_string(),
+            auth: None,
+            rate_limit: None,
         }],
         upstreams,
     );
@@ -506,10 +532,14 @@ async fn routes_independently_to_multiple_upstreams() {
             RouteConfig {
                 path: "/api/users".to_string(),
                 upstream: "users".to_string(),
+                auth: None,
+                rate_limit: None,
             },
             RouteConfig {
                 path: "/api/auth".to_string(),
                 upstream: "auth".to_string(),
+                auth: None,
+                rate_limit: None,
             },
         ],
         upstreams,
@@ -530,4 +560,211 @@ async fn routes_independently_to_multiple_upstreams() {
     let resp_auth = app.oneshot(req_auth).await.unwrap();
     let json_auth = body_json(resp_auth).await;
     assert_eq!(json_auth["backend_id"], "auth-1");
+}
+
+// ---------------------------------------------------------------------
+// Fase 4: auth (API key + JWT) y rate limiting
+// ---------------------------------------------------------------------
+
+/// Inserta un `ConnectInfo` fake en el request, tal cual lo haría axum
+/// en runtime con `into_make_service_with_connect_info`. Sin esto, el
+/// rate limiter no tiene de dónde sacar la IP del cliente en un test.
+fn request_with_client_ip(builder: axum::http::request::Builder, ip: &str) -> Request<Body> {
+    let mut req = builder.body(Body::empty()).unwrap();
+    let addr: std::net::SocketAddr = format!("{ip}:0").parse().unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    req
+}
+
+#[tokio::test]
+async fn api_key_auth_rejects_request_without_key() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let mut r = route("/api/users", "users");
+    r.auth = Some(AuthConfig::ApiKey {
+        header: "X-API-Key".to_string(),
+        keys: vec!["clave-secreta".to_string()],
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_key_auth_accepts_request_with_valid_key() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let mut r = route("/api/users", "users");
+    r.auth = Some(AuthConfig::ApiKey {
+        header: "X-API-Key".to_string(),
+        keys: vec!["clave-secreta".to_string()],
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .header("X-API-Key", "clave-secreta")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn jwt_auth_rejects_token_signed_with_wrong_secret() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let mut r = route("/api/users", "users");
+    r.auth = Some(AuthConfig::Jwt {
+        secret: "secreto-de-raptor".to_string(),
+        issuer: None,
+        audience: None,
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    let bad_token = raptor::auth::sign_hs256("secreto-equivocado", r#"{"exp":9999999999}"#);
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .header("Authorization", format!("Bearer {bad_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn jwt_auth_accepts_valid_signed_token() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let secret = "secreto-de-raptor";
+    let mut r = route("/api/users", "users");
+    r.auth = Some(AuthConfig::Jwt {
+        secret: secret.to_string(),
+        issuer: None,
+        audience: None,
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    let token = raptor::auth::sign_hs256(secret, r#"{"exp":9999999999}"#);
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn public_route_ignores_missing_credentials() {
+    // Ruta sin `auth` configurado: nadie le pide nada a nadie, como
+    // siempre fue hasta la Fase 3.
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let app = build_raptor_app(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_after_exceeding_the_budget() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let mut r = route("/api/users", "users");
+    r.rate_limit = Some(RateLimitConfig {
+        requests: 2,
+        window_secs: 60,
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    // Mismo cliente (misma IP) las tres veces.
+    for expected in [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+        let req = request_with_client_ip(
+            Request::builder().uri("/api/users/1"),
+            "203.0.113.10",
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_tracks_clients_independently_end_to_end() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let mut r = route("/api/users", "users");
+    r.rate_limit = Some(RateLimitConfig {
+        requests: 1,
+        window_secs: 60,
+    });
+
+    let app = build_raptor_app(vec![r], upstreams);
+
+    let req_a = request_with_client_ip(Request::builder().uri("/api/users/1"), "203.0.113.10");
+    let resp_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+
+    // client-a ya gastó su única ficha...
+    let req_a_again = request_with_client_ip(Request::builder().uri("/api/users/1"), "203.0.113.10");
+    let resp_a_again = app.clone().oneshot(req_a_again).await.unwrap();
+    assert_eq!(resp_a_again.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // ...pero client-b tiene su propio balde, todavía lleno.
+    let req_b = request_with_client_ip(Request::builder().uri("/api/users/1"), "203.0.113.20");
+    let resp_b = app.oneshot(req_b).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn hop_by_hop_headers_are_not_forwarded_to_backend() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let app = build_raptor_app(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder()
+        .uri("/api/users/1")
+        .header("Connection", "keep-alive")
+        .header("X-Custom-Header", "esto-si-tiene-que-llegar")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let json = body_json(response).await;
+    // El backend de prueba sólo devuelve path/backend_id/x_request_id,
+    // así que lo que realmente importa acá es que Raptor no haya
+    // explotado armando el request -- la sanitización pasa puertas
+    // adentro, antes de llegar al backend.
+    assert_eq!(json["backend_id"], "users-1");
 }

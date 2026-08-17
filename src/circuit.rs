@@ -76,9 +76,7 @@ impl CircuitBreaker {
             STATE_OPEN => {
                 let elapsed_enough = {
                     let opened_at = self.opened_at.lock().unwrap();
-                    opened_at
-                        .map(|t| t.elapsed() >= self.open_duration)
-                        .unwrap_or(true)
+                    opened_at.map(|t| t.elapsed() >= self.open_duration).unwrap_or(true)
                 };
 
                 if !elapsed_enough {
@@ -119,10 +117,7 @@ impl CircuitBreaker {
         self.half_open_probe_taken.store(false, Ordering::Relaxed);
 
         if previous != STATE_CLOSED {
-            tracing::debug!(
-                "circuit breaker: {}",
-                "backend se recuperó, volvemos a CLOSED"
-            );
+            tracing::debug!("circuit breaker: {}", "backend se recuperó, volvemos a CLOSED");
         }
     }
 
