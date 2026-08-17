@@ -1,0 +1,15 @@
+server:
+  address: 0.0.0.0:8080
+
+logging:
+  level: info
+
+routes:
+  - path: /api/users
+    upstream: http://localhost:3001
+
+  - path: /api/auth
+    upstream: http://localhost:3002
+
+  - path: /api/files
+    upstream: http://localhost:3003
