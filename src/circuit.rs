@@ -149,6 +149,25 @@ impl CircuitBreaker {
         self.state.load(Ordering::Relaxed) == STATE_OPEN
     }
 
+    /// Chequeo liviano y SIN side effects: sólo mira si el circuito
+    /// sigue en cooldown (OPEN y todavía no pasó `open_duration`). No
+    /// hace la transición a HALF-OPEN ni reclama el probe.
+    ///
+    /// Hace falta esto además de `is_available()` porque algunas
+    /// estrategias de balanceo (least connections, random, weighted)
+    /// necesitan evaluar TODOS los backends para elegir uno, y no
+    /// podemos dejar que ese solo hecho de "mirar" un backend le
+    /// consuma el turno de HALF-OPEN a uno que ni terminó siendo
+    /// elegido. Round Robin no tiene este problema porque `find()`
+    /// corta apenas encuentra el primero que sirve.
+    pub fn snapshot_open(&self) -> bool {
+        if self.state.load(Ordering::Relaxed) != STATE_OPEN {
+            return false;
+        }
+        let opened_at = self.opened_at.lock().unwrap();
+        !opened_at.map(|t| t.elapsed() >= self.open_duration).unwrap_or(true)
+    }
+
     /// Estado legible para exponer en `/admin/upstreams` y en las
     /// métricas.
     pub fn state_label(&self) -> &'static str {

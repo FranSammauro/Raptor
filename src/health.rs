@@ -7,7 +7,6 @@
 //! `UpstreamPool::select()` lee de forma lock-free (ver comentario en
 //! `balancer.rs`).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::balancer::UpstreamManager;
@@ -15,23 +14,37 @@ use crate::proxy::HttpClient;
 
 /// Lanza una tarea de health-check por cada upstream configurado.
 /// Las tareas corren indefinidamente en background (`tokio::spawn`) y
-/// viven mientras viva el proceso.
-pub fn spawn_health_checks(manager: Arc<UpstreamManager>, client: HttpClient) {
-    for pool in manager.pools() {
-        let pool = pool.clone();
-        let client = client.clone();
+/// viven mientras viva el proceso -- o hasta que alguien llame `.abort()`
+/// sobre el handle devuelto, que es justo lo que hace `/admin/reload`
+/// con las tareas viejas antes de arrancar las nuevas.
+///
+/// Toma `&UpstreamManager` (no `Arc`) a propósito: cada `UpstreamPool`
+/// adentro ya es un `Arc<UpstreamPool>` clonable, así que no hace falta
+/// dueño compartido del manager entero -- evita el lío de tener dos
+/// `UpstreamManager` construidos por separado (uno para esto, otro para
+/// el estado real) que terminen desincronizados.
+pub fn spawn_health_checks(
+    manager: &UpstreamManager,
+    client: HttpClient,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    manager
+        .pools()
+        .map(|pool| {
+            let pool = pool.clone();
+            let client = client.clone();
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(
-                pool.health_check.interval_secs.max(1),
-            ));
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    pool.health_check.interval_secs.max(1),
+                ));
 
-            loop {
-                interval.tick().await;
-                check_all_backends(&pool, &client).await;
-            }
-        });
-    }
+                loop {
+                    interval.tick().await;
+                    check_all_backends(&pool, &client).await;
+                }
+            })
+        })
+        .collect()
 }
 
 async fn check_all_backends(

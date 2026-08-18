@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use raptor::balancer::UpstreamManager;
 use raptor::config::{
     AuthConfig, CircuitBreakerConfig, HealthCheckConfig, LoadBalancerStrategy, RateLimitConfig,
-    RetryConfig, RouteConfig, UpstreamConfig,
+    RetryConfig, RouteConfig, ServerEntry, UpstreamConfig,
 };
 use raptor::proxy::AppState;
 use raptor::router::Router as RaptorRouter;
@@ -63,7 +63,7 @@ async fn spawn_test_backend(id: &str) -> String {
 fn upstream_config(servers: Vec<String>) -> UpstreamConfig {
     UpstreamConfig {
         load_balancer: LoadBalancerStrategy::RoundRobin,
-        servers,
+        servers: servers.into_iter().map(ServerEntry::from).collect(),
         health_check: HealthCheckConfig::default(),
         timeout_ms: 5000,
         retry: RetryConfig::default(),
@@ -83,7 +83,7 @@ fn upstream_config_with(
 ) -> UpstreamConfig {
     UpstreamConfig {
         load_balancer: LoadBalancerStrategy::RoundRobin,
-        servers,
+        servers: servers.into_iter().map(ServerEntry::from).collect(),
         health_check: HealthCheckConfig::default(),
         timeout_ms,
         retry,
@@ -905,4 +905,194 @@ async fn admin_stats_reports_uptime_and_request_counts() {
     assert_eq!(json["total_gateway_failures"], 0);
     assert_eq!(json["routes_configured"], 1);
     assert!(json["uptime_seconds"].as_f64().unwrap() >= 0.0);
+}
+
+// ---------------------------------------------------------------------
+// Fase 6: reload dinámico y estrategias de balanceo avanzadas
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn reload_endpoint_returns_501_without_a_config_path() {
+    // build_public_and_admin_apps arma el AppState sin config_path
+    // (tal cual pasa en estos tests) -- el endpoint tiene que fallar
+    // prolijo, no explotar.
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/reload")
+        .body(Body::empty())
+        .unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn reload_endpoint_swaps_config_from_disk() {
+    let backend_v1 = spawn_test_backend("v1").await;
+    let backend_v2 = spawn_test_backend("v2").await;
+
+    let config_v1 = format!(
+        "server:\n  address: 0.0.0.0:0\nroutes:\n  - path: /api\n    upstream: svc\nupstreams:\n  svc:\n    servers:\n      - {backend_v1}\n"
+    );
+    let config_v2 = format!(
+        "server:\n  address: 0.0.0.0:0\nroutes:\n  - path: /api\n    upstream: svc\nupstreams:\n  svc:\n    servers:\n      - {backend_v2}\n"
+    );
+
+    let tmp_path = std::env::temp_dir().join(format!("raptor-reload-test-{}.yaml", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp_path, &config_v1).unwrap();
+
+    let config = raptor::config::Config::load(&tmp_path).unwrap();
+    let router = RaptorRouter::new(config.routes.clone());
+    let manager = UpstreamManager::from_config(&config.upstreams);
+    let state = raptor::proxy::AppState::new(router, manager)
+        .with_config_path(tmp_path.to_str().unwrap().to_string());
+
+    let public = raptor::app(state.clone());
+    let admin = raptor::admin::admin_app(state);
+
+    // Antes del reload: pega contra v1.
+    let req = Request::builder().uri("/api/test").body(Body::empty()).unwrap();
+    let resp = public.clone().oneshot(req).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["backend_id"], "v1");
+
+    // Reescribimos el archivo apuntando a v2, y pedimos el reload.
+    std::fs::write(&tmp_path, &config_v2).unwrap();
+    let reload_req = Request::builder()
+        .method("POST")
+        .uri("/admin/reload")
+        .body(Body::empty())
+        .unwrap();
+    let reload_resp = admin.oneshot(reload_req).await.unwrap();
+    assert_eq!(reload_resp.status(), StatusCode::OK);
+
+    // Después del reload, sin reiniciar nada: ahora pega contra v2.
+    let req = Request::builder().uri("/api/test").body(Body::empty()).unwrap();
+    let resp = public.oneshot(req).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["backend_id"], "v2");
+
+    std::fs::remove_file(&tmp_path).ok();
+}
+
+#[tokio::test]
+async fn reload_endpoint_rejects_invalid_config_without_disrupting_traffic() {
+    let backend_addr = spawn_test_backend("v1").await;
+    let config_v1 = format!(
+        "server:\n  address: 0.0.0.0:0\nroutes:\n  - path: /api\n    upstream: svc\nupstreams:\n  svc:\n    servers:\n      - {backend_addr}\n"
+    );
+
+    let tmp_path = std::env::temp_dir().join(format!("raptor-reload-bad-{}.yaml", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp_path, &config_v1).unwrap();
+
+    let config = raptor::config::Config::load(&tmp_path).unwrap();
+    let router = RaptorRouter::new(config.routes.clone());
+    let manager = UpstreamManager::from_config(&config.upstreams);
+    let state = raptor::proxy::AppState::new(router, manager)
+        .with_config_path(tmp_path.to_str().unwrap().to_string());
+
+    let public = raptor::app(state.clone());
+    let admin = raptor::admin::admin_app(state);
+
+    // Escribimos YAML inválido (upstream referenciado no existe).
+    std::fs::write(&tmp_path, "server:\n  address: 0.0.0.0:0\nroutes:\n  - path: /api\n    upstream: no-existe\nupstreams: {}\n").unwrap();
+
+    let reload_req = Request::builder()
+        .method("POST")
+        .uri("/admin/reload")
+        .body(Body::empty())
+        .unwrap();
+    let reload_resp = admin.oneshot(reload_req).await.unwrap();
+    assert_eq!(reload_resp.status(), StatusCode::BAD_REQUEST);
+
+    // El tráfico sigue andando con la config vieja, ni se enteró.
+    let req = Request::builder().uri("/api/test").body(Body::empty()).unwrap();
+    let resp = public.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    std::fs::remove_file(&tmp_path).ok();
+}
+
+#[tokio::test]
+async fn weighted_round_robin_end_to_end_via_config() {
+    let addr_a = spawn_test_backend("a").await;
+    let addr_b = spawn_test_backend("b").await;
+
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        UpstreamConfig {
+            load_balancer: LoadBalancerStrategy::WeightedRoundRobin,
+            servers: vec![
+                ServerEntry::Weighted { url: addr_a, weight: 3 },
+                ServerEntry::Weighted { url: addr_b, weight: 1 },
+            ],
+            health_check: HealthCheckConfig::default(),
+            timeout_ms: 5000,
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            allow_link_local_upstreams: false,
+        },
+    );
+
+    let app = build_raptor_app(vec![route("/api/users", "users")], upstreams);
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for _ in 0..8 {
+        let req = Request::builder().uri("/api/users/1").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let json = body_json(resp).await;
+        *counts.entry(json["backend_id"].as_str().unwrap().to_string()).or_insert(0) += 1;
+    }
+
+    assert_eq!(*counts.get("a").unwrap(), 6);
+    assert_eq!(*counts.get("b").unwrap(), 2);
+}
+
+#[tokio::test]
+async fn admin_upstreams_reports_load_balancer_strategy() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "users".to_string(),
+        UpstreamConfig {
+            load_balancer: LoadBalancerStrategy::LeastConnections,
+            servers: vec![ServerEntry::from(backend_addr)],
+            health_check: HealthCheckConfig::default(),
+            timeout_ms: 5000,
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            allow_link_local_upstreams: false,
+        },
+    );
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/admin/upstreams").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    let json = body_json(response).await;
+    assert_eq!(json[0]["load_balancer"], "LeastConnections");
+}
+
+#[tokio::test]
+async fn dashboard_endpoint_serves_html() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/admin/dashboard").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("<title>Raptor"));
 }

@@ -6,7 +6,7 @@
 //! mismo loop de reintentos que ya andaba desde la Fase 3.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -27,13 +27,64 @@ use crate::router::Router;
 
 pub type HttpClient = Client<HttpConnector, Body>;
 
+// Nota técnica (Fase 6): HTTPS hacia upstreams quedó afuera de esta
+// fase. No por falta de ganas -- lo intenté con `hyper-rustls`, pero la
+// versión que compila contra nuestro rustc 1.75 (0.24.x) está armada
+// para `hyper` 0.14, un ecosistema completamente distinto al `hyper` 1.x
+// + `hyper-util` que usa el resto de Raptor. No hay forma de meterle esa
+// `HttpsConnector` a nuestro `Client<HttpConnector, Body>` sin arrastrar
+// una copia paralela de hyper 0.14 que ni siquiera se puede conectar al
+// tipo que espera nuestro cliente.
+//
+// La versión de `hyper-rustls` que sí habla hyper 1.x (0.27+) pide
+// `rustls` 0.23, que cambia la API de carga de certificados (pki-types
+// en vez de `rustls::Certificate`/`PrivateKey`) y reabre toda la batalla
+// de pines de dependencias contra `edition2024` que ya peleamos en la
+// Fase 4 -- con el resultado incierto de si compila limpio contra este
+// toolchain viejo.
+//
+// El camino correcto para hacerlo bien es escribir un `Connect`
+// customizado (un tipo que implemente
+// `hyper_util::client::legacy::connect::Connect`, decida TCP-plano vs.
+// TCP+TLS mirando el scheme del `Uri`, y envuelva el stream con
+// `tokio-rustls` -- que ya tenemos anda funcionando del lado del
+// listener en tls.rs). Es un chunk de trabajo concreto y acotado, pero
+// no entraba en el presupuesto de esta fase. Queda anotado para la
+// próxima.
+
+/// Router + upstreams, agrupados porque siempre se reemplazan juntos en
+/// un reload (una config nueva trae rutas Y upstreams nuevos a la vez;
+/// no tendría sentido actualizar uno sin el otro a mitad de camino).
+pub struct Shared {
+    pub router: Router,
+    pub upstreams: UpstreamManager,
+}
+
 /// Estado compartido de la aplicación entre todos los handlers de Axum.
+///
+/// `shared` vive detrás de un `RwLock<Arc<Shared>>` -- no un
+/// `RwLock<Shared>` a secas -- a propósito: leer nada más pide el lock
+/// por el tiempo ínfimo que toma clonar un `Arc` (un memcpy de un
+/// puntero + un fetch_add atómico), y después el handler labura sobre su
+/// propia copia del `Arc` sin volver a tocar el lock. `/admin/reload`
+/// es el único que pide el lock de escritura, y sólo por el instante de
+/// cambiar el puntero -- ningún request en curso se entera ni se cae a
+/// mitad de camino.
 #[derive(Clone)]
 pub struct AppState {
-    pub router: Arc<Router>,
-    pub upstreams: Arc<UpstreamManager>,
+    shared: Arc<RwLock<Arc<Shared>>>,
     pub client: HttpClient,
     pub metrics: Arc<Metrics>,
+    /// Handles de las tareas de health-check en curso, para poder
+    /// cancelarlas prolijamente en cada reload (si no, cada reload deja
+    /// tareas huérfanas corriendo para siempre, chequeando pools que ya
+    /// nadie referencia).
+    pub health_task_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Path al YAML de config, para que `/admin/reload` sepa qué releer.
+    /// `None` en los tests (que arman `AppState` a mano sin pasar por
+    /// un archivo real) -- ahí, si algo pide reload, el endpoint
+    /// devuelve 501 en vez de explotar.
+    pub config_path: Option<String>,
     /// Para armar X-Forwarded-Proto sin que cada handler tenga que
     /// adivinar si estamos atrás de TLS o no.
     pub scheme: &'static str,
@@ -48,12 +99,37 @@ impl AppState {
         let client: HttpClient =
             Client::builder(TokioExecutor::new()).build(HttpConnector::new());
         Self {
-            router: Arc::new(router),
-            upstreams: Arc::new(upstreams),
+            shared: Arc::new(RwLock::new(Arc::new(Shared { router, upstreams }))),
             client,
             metrics: Arc::new(Metrics::new()),
+            health_task_handles: Arc::new(Mutex::new(Vec::new())),
+            config_path: None,
             scheme,
         }
+    }
+
+    /// Builder chiquito para setear el config_path después de construir
+    /// el estado -- se usa desde `main.rs`, que recién sabe el path una
+    /// vez parseados los argumentos.
+    pub fn with_config_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = Some(path.into());
+        self
+    }
+
+    /// Copia barata del estado actual (un clone de `Arc`, no una copia
+    /// profunda). Cada handler la pide una vez al principio y labura
+    /// sobre ella durante todo el request -- así, aunque llegue un
+    /// reload a mitad de camino, ese request en particular termina de
+    /// forma consistente contra la config con la que arrancó.
+    pub fn snapshot(&self) -> Arc<Shared> {
+        self.shared.read().unwrap().clone()
+    }
+
+    /// Reemplaza router y upstreams enteros de un saque. Usado por
+    /// `/admin/reload`.
+    pub fn swap(&self, router: Router, upstreams: UpstreamManager) {
+        let new_shared = Arc::new(Shared { router, upstreams });
+        *self.shared.write().unwrap() = new_shared;
     }
 }
 
@@ -107,7 +183,13 @@ pub async fn handle(
     let path = req.uri().path().to_string();
     let client_ip: Option<IpAddr> = connect_info.map(|ConnectInfo(addr)| addr.ip());
 
-    let route = match state.router.match_route(&path) {
+    // Una sola lectura del estado compartido para todo el request -- si
+    // llega un /admin/reload a mitad de camino, este request particular
+    // termina de forma consistente contra la config con la que arrancó,
+    // no queda mitad-viejo mitad-nuevo.
+    let shared = state.snapshot();
+
+    let route = match shared.router.match_route(&path) {
         Some(route) => route.clone(),
         None => {
             tracing::warn!(request_id = %request_id, %method, %path, "no matching route");
@@ -134,7 +216,7 @@ pub async fn handle(
         // es mejor eso que reventar el handler.
         let client_id = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string());
 
-        if let Some(limiter) = state.router.rate_limiter_for(&route.path) {
+        if let Some(limiter) = shared.router.rate_limiter_for(&route.path) {
             if !limiter.check(&client_id) {
                 tracing::warn!(
                     request_id = %request_id, %method, %path,
@@ -147,7 +229,7 @@ pub async fn handle(
         }
     }
 
-    let pool = match state.upstreams.get(&route.upstream) {
+    let pool = match shared.upstreams.get(&route.upstream) {
         Some(pool) => pool,
         None => {
             // No debería pasar nunca -- Config::validate() garantiza que
@@ -201,6 +283,12 @@ pub async fn handle(
                 break;
             }
         };
+
+        // Vive sólo durante este intento puntual -- se dropea al final
+        // del bloque del match de abajo, éxito o fracaso da lo mismo.
+        // Sin esto, la estrategia Least Connections no tendría de dónde
+        // sacar el conteo de conexiones activas reales.
+        let _connection_guard = backend.track_connection();
 
         match attempt_forward(
             &state.client,

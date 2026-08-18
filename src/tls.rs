@@ -85,10 +85,18 @@ pub fn load_rustls_config(tls: &TlsConfig) -> Result<Arc<RustlsServerConfig>, Tl
         .map(PrivateKey)
         .ok_or_else(|| TlsSetupError::EmptyKey(tls.key_path.clone()))?;
 
-    let config = RustlsServerConfig::builder()
+    let mut config = RustlsServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+
+    // Sin esto, el handshake TLS nunca ofrece "h2" en ALPN, así que el
+    // cliente ni se entera de que Raptor podría hablar HTTP/2 -- se
+    // queda en HTTP/1.1 toda la vida aunque hyper-util del otro lado
+    // sepa negociarlo perfectamente. El orden importa: se anuncia h2
+    // primero porque, ante empate, la mayoría de los clientes TLS
+    // respetan la preferencia del servidor.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }

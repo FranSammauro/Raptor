@@ -1,8 +1,9 @@
 server:
   address: 0.0.0.0:8080
   # Descomentar para servir HTTPS en vez de HTTP plano. Certificado y key
-  # se cargan una sola vez al arrancar (sin reload en caliente todavía,
-  # eso es Fase 6).
+  # se cargan una sola vez al arrancar (sin reload de certificados en
+  # caliente todavía). Con ALPN activo, negocia HTTP/2 solo si el
+  # cliente lo soporta.
   # tls:
   #   cert_path: /etc/raptor/certs/fullchain.pem
   #   key_path: /etc/raptor/certs/privkey.pem
@@ -47,7 +48,8 @@ routes:
 
 upstreams:
   users:
-    load_balancer: round_robin
+    # weighted_round_robin | least_connections | random | round_robin
+    load_balancer: weighted_round_robin
     timeout_ms: 5000
     retry:
       max_attempts: 2
@@ -62,8 +64,13 @@ upstreams:
       healthy_threshold: 2
       unhealthy_threshold: 3
     servers:
-      - http://localhost:3001
-      - http://localhost:3011
+      # Cada server puede ser un string simple (weight implícito 1) o
+      # un mapa con weight explícito -- útil cuando un backend es más
+      # potente que los demás y querés que se lleve más tráfico.
+      - url: http://localhost:3001
+        weight: 3
+      - url: http://localhost:3011
+        weight: 1
       - http://localhost:3021
 
   auth:
@@ -72,6 +79,7 @@ upstreams:
       - http://localhost:3002
 
   files:
-    load_balancer: round_robin
+    load_balancer: least_connections
     servers:
       - http://localhost:3003
+      - http://localhost:3013

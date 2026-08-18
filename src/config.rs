@@ -98,17 +98,71 @@ pub struct RouteConfig {
 }
 
 /// Estrategia de balanceo de carga para un upstream.
-///
-/// Fase 2 sólo implementa `RoundRobin`. Las demás estrategias del roadmap
-/// (`weighted_round_robin`, `least_connections`, `random`) llegan en la
-/// Fase 6; declarar la variante ahora hace que un YAML que las mencione
-/// falle en el parseo con un mensaje claro, en vez de ser ignorado en
-/// silencio.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancerStrategy {
     #[default]
     RoundRobin,
+    /// Round robin ponderado (algoritmo "smooth" tipo nginx): los
+    /// backends con más `weight` reciben proporcionalmente más tráfico,
+    /// pero distribuido parejo en el tiempo (no en ráfagas de N seguidos
+    /// al mismo backend).
+    WeightedRoundRobin,
+    /// Manda cada request al backend con menos conexiones activas en
+    /// este momento. Útil cuando los requests tardan tiempos bien
+    /// distintos entre sí -- Round Robin no se entera si un backend
+    /// quedó ocupado con algo lento.
+    LeastConnections,
+    /// Selección pseudo-aleatoria entre los backends disponibles. Simple,
+    /// sin estado que mantener, buena distribución estadística con
+    /// suficiente volumen.
+    Random,
+}
+
+/// Un servidor dentro de un upstream. En el YAML puede ser un string
+/// simple (peso implícito 1) o un mapa con `url` + `weight` explícito --
+/// serde decide cuál es cuál mirando la forma del valor (`untagged`).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ServerEntry {
+    Simple(String),
+    Weighted {
+        url: String,
+        #[serde(default = "default_weight")]
+        weight: u32,
+    },
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+impl ServerEntry {
+    pub fn url(&self) -> &str {
+        match self {
+            ServerEntry::Simple(url) => url,
+            ServerEntry::Weighted { url, .. } => url,
+        }
+    }
+
+    pub fn weight(&self) -> u32 {
+        match self {
+            ServerEntry::Simple(_) => 1,
+            ServerEntry::Weighted { weight, .. } => *weight,
+        }
+    }
+}
+
+impl From<&str> for ServerEntry {
+    fn from(url: &str) -> Self {
+        ServerEntry::Simple(url.to_string())
+    }
+}
+
+impl From<String> for ServerEntry {
+    fn from(url: String) -> Self {
+        ServerEntry::Simple(url)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -223,8 +277,10 @@ fn default_timeout_ms() -> u64 {
 pub struct UpstreamConfig {
     #[serde(default)]
     pub load_balancer: LoadBalancerStrategy,
-    /// URLs de los servidores del grupo, ej: ["http://localhost:3001", ...]
-    pub servers: Vec<String>,
+    /// Servidores del grupo. Cada uno puede ser un string simple
+    /// ("http://localhost:3001", peso 1) o un mapa con weight explícito
+    /// -- ver `ServerEntry`.
+    pub servers: Vec<ServerEntry>,
     #[serde(default)]
     pub health_check: HealthCheckConfig,
     /// Timeout por request hacia el backend. Si se cumple, cuenta como
@@ -334,17 +390,24 @@ impl Config {
                 )));
             }
             for server in &upstream.servers {
-                if !(server.starts_with("http://") || server.starts_with("https://")) {
+                let url = server.url();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return Err(ConfigError::Invalid(format!(
-                        "el servidor '{server}' del upstream '{name}' debe ser una URL http(s) válida"
+                        "el servidor '{url}' del upstream '{name}' debe ser una URL http(s) válida"
+                    )));
+                }
+                if server.weight() == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "el servidor '{url}' del upstream '{name}' tiene weight 0, no tiene sentido \
+                         (si no querés que reciba tráfico, sacalo de la lista)"
                     )));
                 }
                 if !upstream.allow_link_local_upstreams {
-                    if let Some(host) = extract_host(server) {
+                    if let Some(host) = extract_host(url) {
                         if let Ok(std::net::IpAddr::V4(ipv4)) = host.parse::<std::net::IpAddr>() {
                             if ipv4.is_link_local() {
                                 return Err(ConfigError::Invalid(format!(
-                                    "el servidor '{server}' del upstream '{name}' apunta a una \
+                                    "el servidor '{url}' del upstream '{name}' apunta a una \
                                      dirección link-local (169.254.0.0/16) -- típicamente el \
                                      endpoint de metadata del cloud. Si es realmente lo que \
                                      querés, seteá 'allow_link_local_upstreams: true' en el \
@@ -419,7 +482,7 @@ mod tests {
     fn minimal_upstream(servers: Vec<&str>) -> UpstreamConfig {
         UpstreamConfig {
             load_balancer: LoadBalancerStrategy::RoundRobin,
-            servers: servers.into_iter().map(|s| s.to_string()).collect(),
+            servers: servers.into_iter().map(ServerEntry::from).collect(),
             health_check: HealthCheckConfig::default(),
             timeout_ms: 5000,
             retry: RetryConfig::default(),

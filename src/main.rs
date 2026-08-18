@@ -47,12 +47,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raptor_router = RaptorRouter::new(config.routes.clone());
     let upstream_manager = UpstreamManager::from_config(&config.upstreams);
     let scheme = if tls_enabled { "https" } else { "http" };
-    let state = AppState::new_with_scheme(raptor_router, upstream_manager, scheme);
+    let state = AppState::new_with_scheme(raptor_router, upstream_manager, scheme)
+        .with_config_path(config_path.clone());
 
     // Los health checks corren en background durante toda la vida del
     // proceso, actualizando el estado de cada backend de forma lock-free
-    // (ver src/balancer.rs).
-    raptor::health::spawn_health_checks(state.upstreams.clone(), state.client.clone());
+    // (ver src/balancer.rs). Guardamos los handles para poder
+    // cancelarlos prolijamente si llega un /admin/reload más adelante.
+    {
+        let handles = raptor::health::spawn_health_checks(
+            &state.snapshot().upstreams,
+            state.client.clone(),
+        );
+        *state.health_task_handles.lock().unwrap() = handles;
+    }
 
     let app = raptor::app(state.clone());
 

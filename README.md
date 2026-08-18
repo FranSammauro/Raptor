@@ -5,7 +5,56 @@ Reverse Proxy / API Gateway de alto rendimiento, escrito en Rust.
 Ver [informe técnico completo](docs/architecture.md) para el diseño conceptual
 y el roadmap de fases.
 
-## Estado actual: Fase 5 — Observability
+## Estado actual: Fase 6 — Advanced
+
+- [x] Weighted Round Robin: algoritmo "smooth" tipo nginx (reparte
+      proporcional al `weight` de cada server, pero distribuido en el
+      tiempo, no en ráfagas)
+- [x] Least Connections: cada backend cuenta sus conexiones activas
+      (`AtomicUsize` + un guard RAII que descuenta sola al terminar el
+      request); se elige el que tenga menos
+- [x] Random: selección pseudo-aleatoria (xorshift64 sembrado con el
+      reloj, sin sumar la crate `rand` para evitar otra ronda de pines
+      de versiones)
+- [x] Config reload dinámico: `POST /admin/reload` vuelve a leer el
+      YAML del disco, lo valida, y si está todo bien reemplaza router +
+      upstreams **sin bajar el proceso ni cortar conexiones en curso**
+      (`RwLock<Arc<Shared>>`, ver nota técnica abajo). Si el YAML es
+      inválido, Raptor se queda con la config vieja y devuelve el error
+      -- no tira el gateway abajo por un typo
+- [x] Dashboard: HTML estático de un solo archivo (sin build step, sin
+      React) servido en `GET /admin/dashboard`, con polling a los
+      endpoints de admin ya existentes
+- [x] HTTP/2 del lado del cliente-a-Raptor: ALPN configurado en el
+      listener TLS (`h2` + `http/1.1`) -- el listener plano ya venía con
+      soporte H1/H2c automático de `hyper-util`
+- [ ] HTTPS hacia upstreams: **diferido**, ver nota técnica
+
+**Nota técnica -- reload sin downtime:** `router` y `upstreams` viven
+juntos detrás de un `RwLock<Arc<Shared>>` en vez de ser campos sueltos.
+Cada request pide el snapshot actual una sola vez al principio (un
+`clone()` de `Arc`, básicamente gratis) y labura sobre esa copia durante
+todo su ciclo de vida -- así, si un reload cambia el puntero a mitad de
+camino, ningún request en curso queda "mitad viejo, mitad nuevo". El
+lock de escritura sólo se pide por el instante de cambiar el puntero.
+Las tareas de health-check viejas se cancelan (`.abort()`) antes de
+lanzar las nuevas, para no dejar tareas huérfanas corriendo para
+siempre contra pools que ya nadie referencia.
+
+**Nota técnica -- por qué no hay HTTPS hacia upstreams todavía:** se
+intentó con `hyper-rustls`, pero la versión que compila contra el
+`rustc` 1.75 de este entorno (0.24.x) está armada para `hyper` 0.14 --
+un ecosistema completamente distinto al `hyper` 1.x + `hyper-util` que
+usa el resto de Raptor, y no hay forma de conectarla a nuestro
+`Client<HttpConnector, Body>`. La versión que sí habla hyper 1.x
+(0.27+) exige `rustls` 0.23, que cambia la API de certificados
+(`pki-types`) y reabre la batalla de pines contra `edition2024` de la
+Fase 4, con resultado incierto. El camino correcto es escribir un
+`Connect` propio que decida TCP-plano vs. TCP+TLS mirando el scheme del
+`Uri` (reusando el `tokio-rustls` que ya anda del lado del listener) --
+scope concreto, pero no entraba en el presupuesto de esta fase.
+
+### Fase 5 — Observability ✅
 
 - [x] `/metrics` en formato de exposición de Prometheus (texto plano),
       armado a mano: contadores de requests por método/ruta/status,
@@ -292,14 +341,56 @@ Con `server.admin` configurado, quedan disponibles en ese puerto:
 | Endpoint | Qué devuelve |
 |---|---|
 | `GET /admin/routes` | rutas configuradas, upstream, si tiene auth y de qué tipo, si tiene rate limit |
-| `GET /admin/upstreams` | cada upstream con sus backends: URL, `healthy` (health checker) y `circuit_state` (closed/open/half_open) |
+| `GET /admin/upstreams` | cada upstream con su estrategia de balanceo y sus backends: URL, weight, `healthy`, `circuit_state`, conexiones activas |
 | `GET /admin/health` | `200` si todo upstream tiene al menos un backend disponible, `503` si alguno se quedó sin ninguno — pensado como liveness/readiness probe de Raptor mismo |
 | `GET /admin/stats` | uptime, total de requests, total de fallos de gateway, cantidad de rutas/upstreams configurados |
+| `POST /admin/reload` | relee el YAML del disco y reemplaza router+upstreams en caliente, sin bajar el proceso (ver nota de Fase 6 más arriba) |
+| `GET /admin/dashboard` | página HTML de un solo archivo con el estado de rutas/upstreams, actualizada por polling |
 | `GET /metrics` | texto formato Prometheus — contadores, histograma de latencia, gauges de salud/circuito |
 
 Sin `server.admin`, ninguno de estos endpoints existe — ni en el puerto
 público ni en ningún lado. No es "está pero rechaza": directamente no
 hay ruta que lo sirva.
+
+### Balanceo de carga avanzado (Fase 6)
+
+```yaml
+upstreams:
+  users:
+    load_balancer: weighted_round_robin  # round_robin | weighted_round_robin | least_connections | random
+    servers:
+      - url: http://localhost:3001
+        weight: 3    # se lleva ~3x más tráfico que un server de weight 1
+      - url: http://localhost:3011
+        weight: 1
+      - http://localhost:3021   # string simple = weight 1 implícito
+```
+
+- **`round_robin`** (default): el de toda la vida, uno por uno en orden.
+- **`weighted_round_robin`**: algoritmo "smooth" (el mismo que usa
+  nginx) — reparte proporcional al peso, pero sin ráfagas largas al
+  backend dominante.
+- **`least_connections`**: manda al backend con menos conexiones activas
+  en este momento. Mejor que Round Robin cuando los requests tardan
+  tiempos bien distintos entre sí.
+- **`random`**: selección pseudo-aleatoria entre los disponibles.
+
+Todas las estrategias respetan el health checker y el circuit breaker
+por igual — un backend `UNHEALTHY` o con el circuito `OPEN` queda afuera
+de la rotación sea cual sea el algoritmo elegido.
+
+### Config reload dinámico (Fase 6)
+
+```bash
+curl -X POST http://localhost:9090/admin/reload
+```
+
+Vuelve a leer el mismo archivo que Raptor cargó al arrancar, lo valida
+igual que en el arranque, y si pasa la validación reemplaza rutas y
+upstreams sin bajar el proceso ni afectar conexiones en curso. Si el
+YAML tiene un error, la respuesta es `400` con el detalle y Raptor sigue
+sirviendo tráfico con la config anterior — un typo en el YAML no debería
+poder tirar el gateway abajo.
 
 **Métricas expuestas en `/metrics`:**
 
@@ -348,7 +439,8 @@ detalle completo de las 7 fases planeadas. Resumen:
       graceful shutdown
 - [x] **Fase 4 — Security**: rate limiting, API keys, JWT, TLS, SSRF
 - [x] **Fase 5 — Observability**: métricas Prometheus, admin API
-- [ ] **Fase 6 — Advanced**: weighted LB, least connections, config reload,
-      dashboard
+- [x] **Fase 6 — Advanced**: weighted LB, least connections, random,
+      config reload dinámico, dashboard, HTTP/2 (listener). HTTPS hacia
+      upstreams queda diferido (ver nota técnica más arriba)
 - [ ] **Fase 7 — Production polish**: benchmarks, Docker, CI/CD, security
       audit
