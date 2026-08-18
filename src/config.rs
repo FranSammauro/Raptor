@@ -19,6 +19,15 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct AdminConfig {
+    /// Dirección donde escucha la API de administración, ej: "127.0.0.1:9090".
+    /// Va en un puerto/listener aparte del tráfico público a propósito
+    /// (ver sección 19 del informe técnico) -- así uno puede bindearlo a
+    /// localhost o a una interfaz interna sin exponerlo a Internet.
+    pub address: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     /// Dirección donde Raptor escucha, ej: "0.0.0.0:8080"
     pub address: String,
@@ -28,6 +37,12 @@ pub struct ServerConfig {
     /// un solo cert/key fijo, cargado una vez al arrancar.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Si está presente, levanta un segundo listener HTTP (sin TLS, por
+    /// ahora) con `/admin/*` y `/metrics`. Si no está, esos endpoints
+    /// directamente no existen -- no hay forma de pegarle a la API de
+    /// admin por accidente si nunca la prendiste.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -421,6 +436,7 @@ mod tests {
             server: ServerConfig {
                 address: "0.0.0.0:8080".to_string(),
                 tls: None,
+                admin: None,
             },
             routes: vec![RouteConfig {
                 path: "/api".to_string(),

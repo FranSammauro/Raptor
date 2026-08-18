@@ -62,6 +62,11 @@ impl Router {
     pub fn rate_limiter_for(&self, route_path: &str) -> Option<&RateLimiter> {
         self.rate_limiters.get(route_path)
     }
+
+    /// Todas las rutas configuradas, para `/admin/routes`.
+    pub fn routes(&self) -> &[RouteConfig] {
+        &self.routes
+    }
 }
 
 #[cfg(test)]

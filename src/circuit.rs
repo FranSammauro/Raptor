@@ -143,9 +143,21 @@ impl CircuitBreaker {
         *self.opened_at.lock().unwrap() = Some(Instant::now());
     }
 
-    #[cfg(test)]
+    /// Si el circuito está abierto ahora mismo. Lo usan tanto los tests
+    /// como el renderizado de métricas/admin API.
     pub fn is_open(&self) -> bool {
         self.state.load(Ordering::Relaxed) == STATE_OPEN
+    }
+
+    /// Estado legible para exponer en `/admin/upstreams` y en las
+    /// métricas.
+    pub fn state_label(&self) -> &'static str {
+        match self.state.load(Ordering::Relaxed) {
+            STATE_CLOSED => "closed",
+            STATE_OPEN => "open",
+            STATE_HALF_OPEN => "half_open",
+            _ => "unknown",
+        }
     }
 }
 

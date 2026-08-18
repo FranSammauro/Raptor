@@ -768,3 +768,141 @@ async fn hop_by_hop_headers_are_not_forwarded_to_backend() {
     // adentro, antes de llegar al backend.
     assert_eq!(json["backend_id"], "users-1");
 }
+
+// ---------------------------------------------------------------------
+// Fase 5: admin API y métricas
+// ---------------------------------------------------------------------
+
+/// Arma el router público y el de admin sobre el MISMO `AppState`, tal
+/// cual pasa en producción (dos listeners, un solo estado compartido).
+/// Sin esto, las métricas que generó el router público nunca
+/// aparecerían del lado del admin -- serían dos mundos separados.
+fn build_public_and_admin_apps(
+    routes: Vec<RouteConfig>,
+    upstreams: HashMap<String, UpstreamConfig>,
+) -> (axum::Router, axum::Router) {
+    let router = RaptorRouter::new(routes);
+    let manager = UpstreamManager::from_config(&upstreams);
+    let state = AppState::new(router, manager);
+    (raptor::app(state.clone()), raptor::admin::admin_app(state))
+}
+
+#[tokio::test]
+async fn admin_routes_lists_configured_routes() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/admin/routes").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    assert_eq!(json[0]["path"], "/api/users");
+    assert_eq!(json[0]["upstream"], "users");
+    assert_eq!(json[0]["rate_limited"], false);
+}
+
+#[tokio::test]
+async fn admin_upstreams_reports_backend_health() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/admin/upstreams").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    let json = body_json(response).await;
+
+    assert_eq!(json[0]["name"], "users");
+    assert_eq!(json[0]["backends"][0]["healthy"], true);
+    assert_eq!(json[0]["backends"][0]["circuit_state"], "closed");
+}
+
+#[tokio::test]
+async fn admin_health_returns_503_when_upstream_has_no_available_backend() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let manager = UpstreamManager::from_config(&upstreams);
+    let pool = manager.get("users").unwrap();
+    pool.backends()[0].record_check_result(false, 2, 1); // lo tumbamos
+
+    let router = RaptorRouter::new(vec![route("/api/users", "users")]);
+    let state = AppState::new(router, manager);
+    let admin = raptor::admin::admin_app(state);
+
+    let req = Request::builder().uri("/admin/health").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "degraded");
+}
+
+#[tokio::test]
+async fn admin_health_returns_200_when_all_upstreams_available() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (_public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/admin/health").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reflects_traffic_from_the_public_router() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    // Tres requests por el router público...
+    for _ in 0..3 {
+        let req = Request::builder().uri("/api/users/1").body(Body::empty()).unwrap();
+        let response = public.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ...tienen que verse reflejados en /metrics del lado del admin,
+    // porque comparten el mismo AppState (mismo Metrics por dentro).
+    let req = Request::builder().uri("/metrics").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(text.contains("raptor_http_requests_total{method=\"GET\",route=\"/api/users\",status=\"200\"} 3"));
+    assert!(text.contains("raptor_upstream_backend_healthy{upstream=\"users\""));
+}
+
+#[tokio::test]
+async fn admin_stats_reports_uptime_and_request_counts() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let (public, admin) = build_public_and_admin_apps(vec![route("/api/users", "users")], upstreams);
+
+    let req = Request::builder().uri("/api/users/1").body(Body::empty()).unwrap();
+    public.oneshot(req).await.unwrap();
+
+    let req = Request::builder().uri("/admin/stats").body(Body::empty()).unwrap();
+    let response = admin.oneshot(req).await.unwrap();
+    let json = body_json(response).await;
+
+    assert_eq!(json["total_requests"], 1);
+    assert_eq!(json["total_gateway_failures"], 0);
+    assert_eq!(json["routes_configured"], 1);
+    assert!(json["uptime_seconds"].as_f64().unwrap() >= 0.0);
+}

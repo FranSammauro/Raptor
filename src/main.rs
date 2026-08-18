@@ -54,7 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (ver src/balancer.rs).
     raptor::health::spawn_health_checks(state.upstreams.clone(), state.client.clone());
 
-    let app = raptor::app(state);
+    let app = raptor::app(state.clone());
+
+    if let Some(admin_config) = &config.server.admin {
+        let admin_app = raptor::admin::admin_app(state.clone());
+        let admin_listener = tokio::net::TcpListener::bind(&admin_config.address).await?;
+        tracing::info!(address = %admin_config.address, "admin API listening");
+
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(admin_listener, admin_app).await {
+                tracing::error!(error = %err, "el listener de admin API se cayó");
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(&config.server.address).await?;
     tracing::info!(address = %config.server.address, "raptor listening");

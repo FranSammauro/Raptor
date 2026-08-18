@@ -5,7 +5,35 @@ Reverse Proxy / API Gateway de alto rendimiento, escrito en Rust.
 Ver [informe técnico completo](docs/architecture.md) para el diseño conceptual
 y el roadmap de fases.
 
-## Estado actual: Fase 4 — Security
+## Estado actual: Fase 5 — Observability
+
+- [x] `/metrics` en formato de exposición de Prometheus (texto plano),
+      armado a mano: contadores de requests por método/ruta/status,
+      fallos de gateway, rechazos de rate limit, histograma de latencia
+      por ruta, y gauges de salud/circuit breaker por backend
+- [x] Admin API de sólo lectura en un listener aparte (`server.admin`):
+      `GET /admin/routes`, `GET /admin/upstreams`, `GET /admin/health`,
+      `GET /admin/stats`
+- [x] `/admin/health` sirve como liveness/readiness probe del propio
+      Raptor (no confundir con los health checks que Raptor le hace A
+      los backends): `200` si todo upstream tiene al menos un backend
+      disponible, `503` si alguno se quedó sin ninguno
+- [x] Sin `server.admin` configurado, `/admin/*` y `/metrics`
+      directamente no existen — ni por accidente quedan expuestos
+- [x] Request ID y latencia por request ya venían de fases anteriores;
+      ahora además alimentan las métricas agregadas
+- [x] Unit tests de métricas (5) + integration tests end-to-end de admin
+      API y `/metrics` reflejando tráfico real del router público (6) +
+      verificado a mano con los dos listeners corriendo en simultáneo
+
+**Nota:** `/admin/*` no tiene autenticación propia todavía. La
+recomendación por ahora es no exponer ese puerto (bindearlo a
+`127.0.0.1` o a una interfaz interna, filtrarlo con firewall/security
+group). Es sólo lectura en esta fase — el día que se sume `POST
+/admin/reload` en la Fase 6 (config dinámica), ahí sí va a hacer falta
+algo más serio.
+
+### Fase 4 — Security ✅
 
 - [x] Rate limiting con Token Bucket, configurable por ruta, un balde por
       cliente (IP)
@@ -250,6 +278,51 @@ error al rango link-local (`169.254.0.0/16`), la dirección que usan
 AWS/GCP/Azure para el endpoint de metadata. Direcciones privadas
 normales y `localhost` siguen totalmente permitidas.
 
+### Observabilidad (Fase 5)
+
+```yaml
+server:
+  address: 0.0.0.0:8080
+  admin:
+    address: 127.0.0.1:9090   # listener aparte, ver nota de seguridad abajo
+```
+
+Con `server.admin` configurado, quedan disponibles en ese puerto:
+
+| Endpoint | Qué devuelve |
+|---|---|
+| `GET /admin/routes` | rutas configuradas, upstream, si tiene auth y de qué tipo, si tiene rate limit |
+| `GET /admin/upstreams` | cada upstream con sus backends: URL, `healthy` (health checker) y `circuit_state` (closed/open/half_open) |
+| `GET /admin/health` | `200` si todo upstream tiene al menos un backend disponible, `503` si alguno se quedó sin ninguno — pensado como liveness/readiness probe de Raptor mismo |
+| `GET /admin/stats` | uptime, total de requests, total de fallos de gateway, cantidad de rutas/upstreams configurados |
+| `GET /metrics` | texto formato Prometheus — contadores, histograma de latencia, gauges de salud/circuito |
+
+Sin `server.admin`, ninguno de estos endpoints existe — ni en el puerto
+público ni en ningún lado. No es "está pero rechaza": directamente no
+hay ruta que lo sirva.
+
+**Métricas expuestas en `/metrics`:**
+
+- `raptor_http_requests_total{method,route,status}` — counter
+- `raptor_http_requests_failed_total{route}` — counter (sólo 502/503/504
+  generados por Raptor; un 5xx que devolvió el backend y Raptor sólo
+  retransmitió no cuenta como fallo del gateway)
+- `raptor_rate_limit_rejections_total{route}` — counter
+- `raptor_http_request_duration_seconds{route}` — histogram (buckets
+  fijos de 5ms a 5s)
+- `raptor_upstream_backend_healthy{upstream,backend}` — gauge (0/1)
+- `raptor_upstream_circuit_open{upstream,backend}` — gauge (0/1)
+- `raptor_uptime_seconds` — gauge
+
+El label `route` usa el *patrón* de la ruta configurada (ej.
+`/api/users`), no el path completo del request — así se evita que cada
+ID de usuario distinto genere una serie temporal nueva en Prometheus.
+
+**Sobre la seguridad del admin API:** por ahora no tiene autenticación
+propia. La recomendación es no exponerlo (bindear a `127.0.0.1`, filtrar
+con firewall) hasta que llegue algo más robusto — hoy es sólo lectura,
+así que el riesgo es bajo, pero conviene tenerlo en cuenta igual.
+
 ## Testing
 
 ```bash
@@ -274,7 +347,7 @@ detalle completo de las 7 fases planeadas. Resumen:
 - [x] **Fase 3 — Reliability**: timeouts, retries, circuit breaker,
       graceful shutdown
 - [x] **Fase 4 — Security**: rate limiting, API keys, JWT, TLS, SSRF
-- [ ] **Fase 5 — Observability**: métricas Prometheus, admin API
+- [x] **Fase 5 — Observability**: métricas Prometheus, admin API
 - [ ] **Fase 6 — Advanced**: weighted LB, least connections, config reload,
       dashboard
 - [ ] **Fase 7 — Production polish**: benchmarks, Docker, CI/CD, security

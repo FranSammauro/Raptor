@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::auth::{self, AuthError};
 use crate::balancer::{Backend, UpstreamManager, UpstreamPool};
 use crate::config::AuthConfig;
+use crate::metrics::Metrics;
 use crate::router::Router;
 
 pub type HttpClient = Client<HttpConnector, Body>;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub router: Arc<Router>,
     pub upstreams: Arc<UpstreamManager>,
     pub client: HttpClient,
+    pub metrics: Arc<Metrics>,
     /// Para armar X-Forwarded-Proto sin que cada handler tenga que
     /// adivinar si estamos atrás de TLS o no.
     pub scheme: &'static str,
@@ -49,6 +51,7 @@ impl AppState {
             router: Arc::new(router),
             upstreams: Arc::new(upstreams),
             client,
+            metrics: Arc::new(Metrics::new()),
             scheme,
         }
     }
@@ -108,6 +111,7 @@ pub async fn handle(
         Some(route) => route.clone(),
         None => {
             tracing::warn!(request_id = %request_id, %method, %path, "no matching route");
+            state.metrics.record_request(method.as_str(), "unmatched", 404, start.elapsed().as_millis() as u64);
             return (StatusCode::NOT_FOUND, "no matching route").into_response();
         }
     };
@@ -118,6 +122,7 @@ pub async fn handle(
                 request_id = %request_id, %method, %path,
                 error = %err, "auth rechazada"
             );
+            state.metrics.record_request(method.as_str(), &route.path, 401, start.elapsed().as_millis() as u64);
             return (StatusCode::UNAUTHORIZED, err.to_string()).into_response();
         }
     }
@@ -135,6 +140,8 @@ pub async fn handle(
                     request_id = %request_id, %method, %path,
                     client_id, "rate limit excedido"
                 );
+                state.metrics.record_rate_limit_rejection(&route.path);
+                state.metrics.record_request(method.as_str(), &route.path, 429, start.elapsed().as_millis() as u64);
                 return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
             }
         }
@@ -151,6 +158,7 @@ pub async fn handle(
                 upstream = %route.upstream,
                 "la ruta referencia un upstream que no existe, raro"
             );
+            state.metrics.record_request(method.as_str(), &route.path, 502, start.elapsed().as_millis() as u64);
             return (StatusCode::BAD_GATEWAY, "unknown upstream").into_response();
         }
     };
@@ -208,6 +216,12 @@ pub async fn handle(
             Ok(response) => {
                 backend.circuit.record_success();
                 log_success(request_id, &method, &path, &route.upstream, &backend, &response, start, attempt);
+                state.metrics.record_request(
+                    method.as_str(),
+                    &route.path,
+                    response.status().as_u16(),
+                    start.elapsed().as_millis() as u64,
+                );
                 return response;
             }
             Err(failure) => {
@@ -249,6 +263,8 @@ pub async fn handle(
         latency_ms = %elapsed.as_millis(),
         "se agotaron los intentos, devolviendo error al cliente"
     );
+
+    state.metrics.record_request(method.as_str(), &route.path, status.as_u16(), elapsed.as_millis() as u64);
 
     (status, message).into_response()
 }

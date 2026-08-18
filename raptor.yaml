@@ -6,6 +6,11 @@ server:
   # tls:
   #   cert_path: /etc/raptor/certs/fullchain.pem
   #   key_path: /etc/raptor/certs/privkey.pem
+  # Sin esto, /admin/* y /metrics directamente no existen. Con esto,
+  # levantan en un listener aparte -- típicamente conviene bindearlo a
+  # 127.0.0.1 o a una interfaz interna, no a 0.0.0.0.
+  admin:
+    address: 127.0.0.1:9090
 
 logging:
   level: info
