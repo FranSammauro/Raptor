@@ -48,7 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_manager = UpstreamManager::from_config(&config.upstreams);
     let scheme = if tls_enabled { "https" } else { "http" };
     let state = AppState::new_with_scheme(raptor_router, upstream_manager, scheme)
-        .with_config_path(config_path.clone());
+        .with_config_path(config_path.clone())
+        .with_max_body_bytes(config.server.max_body_bytes);
 
     // Los health checks corren en background durante toda la vida del
     // proceso, actualizando el estado de cada backend de forma lock-free

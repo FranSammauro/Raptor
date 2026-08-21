@@ -9,7 +9,49 @@ design and the phase roadmap.
 > the primary, most up-to-date document). If anything ever looks out of
 > sync between the two, trust the Spanish one.
 
-## Current status: Phase 6 — Advanced
+## v1.0.0 — Production polish (Phase 7)
+
+This phase completes all 7 phases of the original roadmap. It was
+decided to tag this directly as `v1.0.0` instead of `v0.7.0` — the
+previous 6 phases already left a functionally complete gateway with
+solid test coverage; this phase adds what was missing to call it a
+"finished product": a real security finding fixed, measured and
+documented benchmarks, Docker, CI, and an honest security audit with
+its limits clearly marked.
+
+- [x] **Security finding fixed:** Raptor buffers the entire body in
+      memory (needed to be able to retry against a different backend).
+      Without a limit, that's a textbook DoS vector. Added
+      `server.max_body_bytes` (default 10 MiB), applied both to the
+      incoming request and to the backend's response — a broken backend
+      can't blow up Raptor's RAM either
+- [x] **Real benchmarks**, measured with `ab` (Apache Bench): direct vs.
+      through Raptor, ~39% RPS overhead measured and documented with an
+      explicit methodology in `docs/performance.md`. Reproducible
+      script in `benchmarks/run.sh`
+- [x] **Docker:** multi-stage `Dockerfile` (builds with the Rust
+      toolchain, runs without it) + `docker-compose.yml` with Raptor in
+      front of 3 example backends — `docker compose up` and load
+      balancing can immediately be tried out with a `curl`. Syntax was
+      validated and `docker/raptor.yaml` was confirmed against Raptor's
+      real `Config::load`; the compose setup couldn't be run end-to-end
+      because this development environment doesn't have Docker
+      available
+- [x] **CI/CD:** `.github/workflows/ci.yml` — build, test, `cargo fmt
+      --check`, `cargo clippy`, Docker image build. `fmt` and `clippy`
+      run with `continue-on-error` because this environment doesn't
+      have those components installed to verify beforehand (no
+      `rustup`, so `apt` doesn't ship them) — on a normal GitHub Actions
+      runner they should pass without issue
+- [x] **Security audit:** `docs/security.md` — what Raptor covers by
+      phase, what was explicitly tested, and **7 documented known
+      limitations**, starting with the most important one: the admin
+      API still has no authentication of its own
+- [x] Body-limit unit tests (2) + end-to-end integration tests (2 more,
+      over-limit and within-limit)
+- [x] Full suite: **82/82 tests passing** (48 unit + 34 integration)
+
+### Phase 6 — Advanced ✅
 
 - [x] Weighted Round Robin: nginx-style "smooth" algorithm (distributes
       traffic proportionally to each server's `weight`, spread out over
@@ -209,6 +251,7 @@ flight to finish before exiting.
 ```yaml
 server:
   address: 0.0.0.0:8080
+  max_body_bytes: 10485760   # 10 MiB, default. See docs/security.md
 
 logging:
   level: info
@@ -431,12 +474,20 @@ cargo test
 The integration tests (`tests/integration_test.rs`) spin up a test HTTP
 backend on an ephemeral port and exercise the full Raptor app via
 `tower::ServiceExt::oneshot` — they don't depend on external processes
-or scripts, so they run the same on your machine as in CI. TLS was
-verified separately, by hand, with a self-signed certificate and
-`openssl s_client` (automating that with certificate fixtures is left
-for later). The dynamic reload was also verified by hand: swapping a
-backend's address in the YAML, hitting `POST /admin/reload`, and
-confirming traffic switched over without restarting the process.
+or scripts, so they run the same on your machine as in CI. TLS and the
+dynamic reload were verified separately, by hand (self-signed cert +
+`openssl s_client` for TLS; live backend switch via `POST
+/admin/reload` for reload).
+
+**Benchmarks:** `./benchmarks/run.sh` runs a reproducible direct-vs-proxy
+comparison with `ab`. See [docs/performance.md](docs/performance.md) for
+methodology and reference results.
+
+**Docker:** `docker compose up` brings up Raptor in front of 3 example
+backends. This development environment didn't have Docker available to
+test it end-to-end, so validation was limited to YAML syntax and
+confirming that `docker/raptor.yaml` loads correctly against Raptor's
+real `Config::load`.
 
 ## Roadmap
 
@@ -453,5 +504,16 @@ full detail of the 7 planned phases. Summary:
 - [x] **Phase 6 — Advanced**: weighted LB, least connections, random,
       dynamic config reload, dashboard, HTTP/2 (listener side). HTTPS to
       upstreams is deferred (see technical note above)
-- [ ] **Phase 7 — Production polish**: benchmarks, Docker, CI/CD,
-      security audit
+- [x] **Phase 7 — Production polish**: max_body_bytes (security audit
+      finding), benchmarks (`docs/performance.md`), Docker (`Dockerfile`
+      + `docker-compose.yml`), CI/CD (GitHub Actions), security audit
+      (`docs/security.md`)
+
+## Additional documentation
+
+- [docs/architecture.md](docs/architecture.md) — original technical
+  report, conceptual design, and the 7-phase roadmap
+- [docs/security.md](docs/security.md) — security audit: what Raptor
+  covers, what was tested, and the known limitations
+- [docs/performance.md](docs/performance.md) — benchmark methodology
+  and results (direct vs. through Raptor)

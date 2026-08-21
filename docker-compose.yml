@@ -1,0 +1,45 @@
+# docker compose up
+#
+# Levanta Raptor delante de 3 instancias del mismo backend de ejemplo
+# (una imagen mínima de Python que responde su propio nombre), para que
+# cualquiera que clone el repo pueda ver el load balancing andando con
+# un solo curl:
+#
+#   curl http://localhost:8080/api/echo
+#
+# repetido unas cuantas veces, y mirar cómo rota entre echo-1/2/3.
+
+services:
+  raptor:
+    build: .
+    ports:
+      - "8080:8080"   # tráfico público
+      - "9090:9090"   # admin API + /metrics -- OJO: expuesto acá sólo
+                       # para que el ejemplo sea fácil de probar. En un
+                       # despliegue real, este puerto no debería
+                       # publicarse hacia afuera (ver docs/security.md).
+    volumes:
+      - ./docker/raptor.yaml:/etc/raptor/raptor.yaml:ro
+    depends_on:
+      - echo-1
+      - echo-2
+      - echo-3
+    restart: unless-stopped
+
+  echo-1:
+    build: ./docker/echo-backend
+    environment:
+      - BACKEND_NAME=echo-1
+    restart: unless-stopped
+
+  echo-2:
+    build: ./docker/echo-backend
+    environment:
+      - BACKEND_NAME=echo-2
+    restart: unless-stopped
+
+  echo-3:
+    build: ./docker/echo-backend
+    environment:
+      - BACKEND_NAME=echo-3
+    restart: unless-stopped

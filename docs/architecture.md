@@ -193,3 +193,10 @@ interesante en sí misma.
   backend intervino, cuánto tardó y qué status devolvió.
 - **Performance**: overhead del proxy medido y documentado.
 - **Reproducibilidad**: `docker compose up` deja todo listo para probar.
+
+## 30. Visión final
+
+> La regla fundamental para este proyecto: no intentes que sea "grande";
+> intentá que sea profundo. Es mucho mejor tener 8 funcionalidades muy bien
+> implementadas — con tests, benchmarks y documentación de las decisiones —
+> que 30 funcionalidades superficiales.

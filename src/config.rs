@@ -33,7 +33,7 @@ pub struct ServerConfig {
     pub address: String,
     /// Si está presente, Raptor termina TLS en este listener. Si no,
     /// sirve HTTP plano nomás. SNI, reload de certificados en caliente y
-    /// HTTPS hacia los upstreams quedan para la Fase 6 -- por ahora es
+    /// HTTPS hacia los upstreams quedan pendientes -- por ahora es
     /// un solo cert/key fijo, cargado una vez al arrancar.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -43,6 +43,19 @@ pub struct ServerConfig {
     /// admin por accidente si nunca la prendiste.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// Tamaño máximo (en bytes) que Raptor deja pasar para el body de un
+    /// request O de una respuesta de backend, antes de cortar con
+    /// `413 Payload Too Large`. Encontrado en el security audit de la
+    /// Fase 7: como bufferizamos el body entero en memoria (necesario
+    /// para poder reintentar contra otro backend, ver proxy.rs), sin
+    /// este límite cualquiera podía mandar un body gigante y hacer que
+    /// Raptor se comiera toda la RAM disponible -- un DoS de manual.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: u64,
+}
+
+fn default_max_body_bytes() -> u64 {
+    10 * 1024 * 1024 // 10 MiB
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -371,6 +384,12 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.max_body_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "server.max_body_bytes debe ser mayor a 0".into(),
+            ));
+        }
+
         if self.routes.is_empty() {
             return Err(ConfigError::Invalid(
                 "debe existir al menos una ruta configurada".into(),
@@ -500,6 +519,7 @@ mod tests {
                 address: "0.0.0.0:8080".to_string(),
                 tls: None,
                 admin: None,
+                max_body_bytes: default_max_body_bytes(),
             },
             routes: vec![RouteConfig {
                 path: "/api".to_string(),

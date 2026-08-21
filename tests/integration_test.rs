@@ -1096,3 +1096,51 @@ async fn dashboard_endpoint_serves_html() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("<title>Raptor"));
 }
+
+// ---------------------------------------------------------------------
+// Fase 7: límite de tamaño de body (hallazgo del security audit)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_request_body_larger_than_configured_limit() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let router = RaptorRouter::new(vec![route("/api/users", "users")]);
+    let manager = UpstreamManager::from_config(&upstreams);
+    let state = AppState::new(router, manager).with_max_body_bytes(16); // límite chiquito a propósito
+    let app = raptor::app(state);
+
+    let big_body = "x".repeat(1024); // muy por encima del límite de 16 bytes
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/users")
+        .body(Body::from(big_body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn accepts_request_body_within_the_configured_limit() {
+    let backend_addr = spawn_test_backend("users-1").await;
+    let mut upstreams = HashMap::new();
+    upstreams.insert("users".to_string(), upstream_config(vec![backend_addr]));
+
+    let router = RaptorRouter::new(vec![route("/api/users", "users")]);
+    let manager = UpstreamManager::from_config(&upstreams);
+    let state = AppState::new(router, manager).with_max_body_bytes(1024 * 1024);
+    let app = raptor::app(state);
+
+    let small_body = "x".repeat(100);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/users")
+        .body(Body::from(small_body))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

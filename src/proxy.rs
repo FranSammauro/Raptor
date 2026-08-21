@@ -85,10 +85,20 @@ pub struct AppState {
     /// un archivo real) -- ahí, si algo pide reload, el endpoint
     /// devuelve 501 en vez de explotar.
     pub config_path: Option<String>,
+    /// Límite de tamaño para bodies (request Y response de backend),
+    /// en bytes. Ver el comentario largo en `config.rs` (`ServerConfig`)
+    /// sobre por qué existe -- default 10 MiB si nadie lo configura.
+    pub max_body_bytes: u64,
     /// Para armar X-Forwarded-Proto sin que cada handler tenga que
     /// adivinar si estamos atrás de TLS o no.
     pub scheme: &'static str,
 }
+
+/// Mismo default que `config::default_max_body_bytes()`, repetido acá
+/// para que `AppState::new()` (usado en tests y en cualquier código que
+/// no pase por `Config::load`) tenga un límite razonable de fábrica en
+/// vez de quedar sin ninguno.
+const DEFAULT_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 impl AppState {
     pub fn new(router: Router, upstreams: UpstreamManager) -> Self {
@@ -104,6 +114,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             health_task_handles: Arc::new(Mutex::new(Vec::new())),
             config_path: None,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             scheme,
         }
     }
@@ -113,6 +124,11 @@ impl AppState {
     /// vez parseados los argumentos.
     pub fn with_config_path(mut self, path: impl Into<String>) -> Self {
         self.config_path = Some(path.into());
+        self
+    }
+
+    pub fn with_max_body_bytes(mut self, limit: u64) -> Self {
+        self.max_body_bytes = limit;
         self
     }
 
@@ -250,11 +266,24 @@ pub async fn handle(
     // El body sólo se puede leer una vez, así que lo bufferizamos antes
     // de entrar al loop de reintentos. Para requests con body gigante
     // esto no es ideal (va todo a memoria), pero streamear un retry es
-    // un quilombo mayor y queda fuera del alcance de esta fase.
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            tracing::error!(request_id = %request_id, error = %err, "no se pudo leer el body del request");
+    // un quilombo mayor y queda fuera del alcance de esta fase -- por
+    // eso el límite de tamaño de acá abajo no es opcional, es lo que
+    // evita que "todo a memoria" se convierta en "toda la RAM del
+    // servidor" (ver security audit, Fase 7).
+    let body_bytes = match collect_body_with_limit(body, state.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(BodyCollectError::TooLarge) => {
+            tracing::warn!(
+                request_id = %request_id, %method, %path,
+                limit_bytes = state.max_body_bytes,
+                "request body excede el límite configurado"
+            );
+            state.metrics.record_request(method.as_str(), &route.path, 413, start.elapsed().as_millis() as u64);
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+        }
+        Err(BodyCollectError::ReadError) => {
+            tracing::error!(request_id = %request_id, %method, %path, "no se pudo leer el body del request");
+            state.metrics.record_request(method.as_str(), &route.path, 400, start.elapsed().as_millis() as u64);
             return (StatusCode::BAD_REQUEST, "could not read request body").into_response();
         }
     };
@@ -298,6 +327,7 @@ pub async fn handle(
             &body_bytes,
             request_id,
             original_host.as_deref(),
+            state.max_body_bytes,
         )
         .await
         {
@@ -431,6 +461,7 @@ async fn attempt_forward(
     body_bytes: &Bytes,
     request_id: Uuid,
     original_host: Option<&str>,
+    max_body_bytes: u64,
 ) -> Result<Response, AttemptFailure> {
     let path_and_query = parts
         .uri
@@ -494,11 +525,52 @@ async fn attempt_forward(
         Ok(Err(_hyper_err)) => Err(AttemptFailure::ConnectError),
         Ok(Ok(response)) => {
             let (resp_parts, resp_body) = response.into_parts();
-            let collected = resp_body
-                .collect()
+            // Mismo límite que usamos para el request entrante: un
+            // backend roto (o directamente hostil) tampoco debería
+            // poder tirar la RAM de Raptor mandando una respuesta
+            // gigante. Lo tratamos como ConnectError (502) -- desde la
+            // perspectiva del cliente, el upstream "no respondió bien".
+            let body_bytes = collect_body_with_limit(resp_body, max_body_bytes)
                 .await
                 .map_err(|_| AttemptFailure::ConnectError)?;
-            Ok(Response::from_parts(resp_parts, Body::from(collected.to_bytes())))
+            Ok(Response::from_parts(resp_parts, Body::from(body_bytes)))
         }
     }
+}
+
+/// Por qué falló la lectura de un body -- se usa tanto para el request
+/// entrante como para la respuesta del backend.
+enum BodyCollectError {
+    /// Superó `max_body_bytes`. Cortamos la lectura apenas lo
+    /// detectamos, no hace falta seguir leyendo el resto para tirarlo.
+    TooLarge,
+    /// Cualquier otro problema leyendo el stream (conexión cortada a
+    /// mitad de camino, frame corrupto, lo que sea).
+    ReadError,
+}
+
+/// Lee un body frame por frame acumulando bytes, cortando apenas se
+/// pasa de `limit`. A diferencia de `BodyExt::collect()` (que lee TODO
+/// antes de darte la chance de decidir si te importa el tamaño), esto
+/// nos deja abortar la lectura a mitad de camino -- no tiene sentido
+/// seguir recibiendo gigabytes de un request que ya sabemos que vamos a
+/// rechazar.
+async fn collect_body_with_limit<B>(mut body: B, limit: u64) -> Result<Bytes, BodyCollectError>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+{
+    let mut collected: Vec<u8> = Vec::new();
+
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(|_| BodyCollectError::ReadError)?;
+
+        if let Some(data) = frame.data_ref() {
+            collected.extend_from_slice(data);
+            if collected.len() as u64 > limit {
+                return Err(BodyCollectError::TooLarge);
+            }
+        }
+    }
+
+    Ok(Bytes::from(collected))
 }

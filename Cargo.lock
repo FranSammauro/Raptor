@@ -544,6 +544,7 @@ dependencies = [
  "futures-util",
  "getrandom",
  "hmac",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

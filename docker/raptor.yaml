@@ -1,0 +1,23 @@
+server:
+  address: 0.0.0.0:8080
+  admin:
+    address: 0.0.0.0:9090
+
+logging:
+  level: info
+
+routes:
+  - path: /api/echo
+    upstream: echo
+
+upstreams:
+  echo:
+    load_balancer: round_robin
+    health_check:
+      path: /health
+      interval_secs: 5
+      unhealthy_threshold: 2
+    servers:
+      - http://echo-1:8000
+      - http://echo-2:8000
+      - http://echo-3:8000
